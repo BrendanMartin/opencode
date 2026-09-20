@@ -264,9 +264,8 @@ describe("AzurePlugin", () => {
                   type: "string",
                   key: "resourceName",
                   title: "Enter Azure Resource Name",
-                  description: "Leave empty to use the resource of your Azure CLI session",
                   placeholder: "e.g. my-models",
-                  required: false,
+                  required: true,
                 },
               ],
             })
@@ -810,125 +809,6 @@ describe("AzurePlugin", () => {
             [Model.ID.make("gpt-5-nano"), Model.ID.make("nano-production"), "GPT-5 Nano", 300_000],
           ])
         }),
-    ),
-  )
-
-  it.live("uses the only Azure resource of the Azure CLI session while connecting", () => {
-    const commands: string[][] = []
-    return withEnv({ AZURE_RESOURCE_NAME: undefined, AZURE_COGNITIVE_SERVICES_RESOURCE_NAME: undefined }, () =>
-      withAzureCommands(
-        (args) => {
-          commands.push([...args])
-          return cliTokens(args)
-        },
-        () =>
-          withAzure(
-            (request) =>
-              request.method === "POST"
-                ? Response.json({ data: [account("detected-resource")] })
-                : Response.json({ data: [] }),
-            ({ endpoints, requests }) =>
-              Effect.gen(function* () {
-                yield* addPlugin(endpoints)
-                // Looking the resource up belongs to connecting, never to startup.
-                expect(commands).toEqual([])
-                const integrations = yield* Integration.Service
-                const integrationID = Integration.ID.make("azure")
-                const attempt = yield* integrations.oauth.connect({
-                  integrationID,
-                  methodID: Integration.MethodID.make("azure-cli"),
-                })
-                yield* eventually(
-                  integrations.oauth.status({ integrationID, attemptID: attempt.attemptID }).pipe(Effect.orDie),
-                  (status) => status.status !== "pending",
-                )
-
-                expect((yield* (yield* Credential.Service).list(integrationID))[0]?.value).toMatchObject({
-                  type: "oauth",
-                  access: "https://cognitiveservices.azure.com/.default-token",
-                  metadata: { resourceName: "detected-resource" },
-                })
-                expect(commands.map((args) => args[3])).toEqual([
-                  "https://management.azure.com/.default",
-                  "https://cognitiveservices.azure.com/.default",
-                ])
-                expect(requests[0]?.body).toContain("isnotempty(resourceName)")
-              }),
-          ),
-      ),
-    )
-  })
-
-  it.live("offers resources across all Resource Graph pages instead of choosing the first page's only resource", () =>
-    withEnv({ AZURE_RESOURCE_NAME: undefined, AZURE_COGNITIVE_SERVICES_RESOURCE_NAME: undefined }, () =>
-      withAzureCommands(cliTokens, () =>
-        withAzure(
-          (request) =>
-            Response.json(
-              request.body.includes('"$skipToken":"next"')
-                ? { data: [account("second-resource")] }
-                : { data: [account("first-resource")], $skipToken: "next" },
-            ),
-          ({ endpoints, requests }) =>
-            Effect.gen(function* () {
-              yield* addPlugin(endpoints)
-              const integrations = yield* Integration.Service
-              const integrationID = Integration.ID.make("azure")
-              const attempt = yield* integrations.oauth.connect({
-                integrationID,
-                methodID: Integration.MethodID.make("azure-cli"),
-              })
-              const status = yield* eventually(
-                integrations.oauth.status({ integrationID, attemptID: attempt.attemptID }).pipe(Effect.orDie),
-                (status) => status.status !== "pending",
-              )
-
-              expect(status).toMatchObject({
-                status: "failed",
-                message: "Found 2 Azure resources. Connect again to choose one.",
-              })
-              expect(requests).toHaveLength(2)
-              expect(JSON.parse(requests[1].body)).toEqual({
-                query: JSON.parse(requests[0].body).query,
-                options: { $skipToken: "next" },
-              })
-              expect(yield* (yield* Credential.Service).list(integrationID)).toEqual([])
-              const methods = (yield* integrations.get(integrationID))?.methods ?? []
-              expect(methods.find((method) => method.type === "oauth")?.form).toEqual([
-                {
-                  type: "string",
-                  key: "resourceName",
-                  title: "Enter Azure Resource Name",
-                  placeholder: "e.g. my-models",
-                  required: true,
-                  options: [
-                    {
-                      value: "first-resource",
-                      label: "first-resource",
-                      description: "rg-first-resource · swedencentral",
-                    },
-                    {
-                      value: "second-resource",
-                      label: "second-resource",
-                      description: "rg-second-resource · swedencentral",
-                    },
-                  ],
-                  custom: true,
-                },
-              ])
-              // An API key cannot look resources up, so its prompt stays a plain required name.
-              expect(methods.find((method) => method.type === "key")?.form).toEqual([
-                {
-                  type: "string",
-                  key: "resourceName",
-                  title: "Enter Azure Resource Name",
-                  placeholder: "e.g. my-models",
-                  required: true,
-                },
-              ])
-            }),
-        ),
-      ),
     ),
   )
 

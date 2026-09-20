@@ -55,13 +55,7 @@ const Accounts = Schema.Struct({
   data: Schema.Array(Schema.Unknown),
   $skipToken: Schema.optional(Schema.NonEmptyString),
 })
-const Account = Schema.Struct({
-  id: Schema.NonEmptyString,
-  resourceName: Schema.NonEmptyString,
-  resourceGroup: Schema.String,
-  location: Schema.String,
-})
-const decodeAccount = Schema.decodeUnknownOption(Account)
+const decodeAccount = Schema.decodeUnknownOption(Schema.Struct({ id: Schema.NonEmptyString }))
 
 type Deployment = { readonly name: string; readonly model: string }
 
@@ -88,7 +82,6 @@ export function make(
         deployments?: readonly Deployment[]
         connection?: Effect.Success<ReturnType<typeof ctx.integration.connection.active>>
       } = {}
-      const listed: { accounts: readonly (typeof Account.Type)[] } = { accounts: [] }
 
       const command = (args: string[]) =>
         processes
@@ -127,7 +120,7 @@ export function make(
         )
 
       // Resource Graph spans every subscription of the Azure CLI session, unlike a per-subscription account list.
-      const accounts = Effect.fn("AzurePlugin.accounts")(function* (resource?: string) {
+      const accounts = Effect.fn("AzurePlugin.accounts")(function* (resource: string) {
         return yield* Stream.paginate(undefined, (skipToken: string | undefined) =>
           HttpClientRequest.post(
             `${endpoints.management}/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01`,
@@ -150,45 +143,17 @@ export function make(
         ).pipe(Stream.runCollect)
       })
 
-      // Runs only while connecting, so listing Azure resources never costs anything at startup.
-      const detect = Effect.fn("AzurePlugin.detect")(function* () {
-        const found = yield* accounts()
-        if (found.length === 1) return found[0].resourceName
-        listed.accounts = found
-        yield* ctx.integration.reload()
-        return yield* Effect.fail(
-          new Error(
-            found.length === 0
-              ? "No Azure resources were found for this Azure CLI session. Connect again and enter the resource name."
-              : `Found ${found.length} Azure resources. Connect again to choose one.`,
-          ),
-        )
-      })
-
       const available = Boolean(which("az"))
-      const form = (cli: boolean) =>
+      const form = () =>
         iife(() => {
           if (resolveResourceName(configured) || typeof configured?.baseURL === "string") return
-          // Only the Azure CLI session can look the resource up, and only until a lookup found several to choose from.
-          const detectable = cli && listed.accounts.length === 0
           return Form.Fields.make([
             {
               type: "string",
               key: "resourceName",
               title: "Enter Azure Resource Name",
               placeholder: "e.g. my-models",
-              required: !detectable,
-              ...(detectable ? { description: "Leave empty to use the resource of your Azure CLI session" } : {}),
-              ...(cli && listed.accounts.length > 0
-                ? {
-                    options: listed.accounts.map((account) => ({
-                      value: account.resourceName,
-                      label: account.resourceName,
-                      description: `${account.resourceGroup} · ${account.location}`,
-                    })),
-                    custom: true,
-                  }
-                : {}),
+              required: true,
             },
           ])
         })
@@ -196,7 +161,7 @@ export function make(
       yield* ctx.integration.transform((editor) => {
         editor.method.update({
           integrationID: Provider.ID.azure,
-          method: { type: "key", label: "API key", form: form(false) },
+          method: { type: "key", label: "API key", form: form() },
         })
         if (!available) return
         editor.method.update({
@@ -205,7 +170,7 @@ export function make(
             id: methodID,
             type: "oauth",
             label: "Microsoft Entra ID (Azure CLI)",
-            form: form(true),
+            form: form(),
           },
           authorize: (answer) =>
             Effect.succeed({
@@ -215,8 +180,7 @@ export function make(
               callback: Effect.gen(function* () {
                 const resourceName =
                   (typeof answer.resourceName === "string" ? answer.resourceName.trim() : "") ||
-                  resolveResourceName(configured) ||
-                  (typeof configured?.baseURL === "string" ? undefined : yield* detect())
+                  resolveResourceName(configured)
                 if (!resourceName) return yield* Effect.fail(new Error("Azure resource name is required"))
                 const current = yield* token(cognitiveScope)
                 return Credential.OAuth.make({
@@ -502,15 +466,15 @@ function credentialResource(credential: Credential.Value | undefined) {
   return typeof resource === "string" && resource.trim() !== "" ? resource : undefined
 }
 
-function accountQuery(resource?: string) {
+function accountQuery(resource: string) {
   return [
     "resources",
     "| where type =~ 'microsoft.cognitiveservices/accounts' and kind in~ ('AIServices', 'OpenAI')",
     // The custom subdomain is the resource name of every endpoint, and Entra ID authentication requires one.
     "| extend resourceName = tostring(properties.customSubDomainName)",
-    resource === undefined ? "| where isnotempty(resourceName)" : `| where resourceName =~ '${resource}'`,
-    "| project id, resourceName, resourceGroup, location",
-    "| order by resourceName asc",
+    `| where resourceName =~ '${resource}'`,
+    "| project id",
+    "| order by id asc",
   ].join(" ")
 }
 
