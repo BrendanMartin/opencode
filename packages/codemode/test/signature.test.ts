@@ -669,6 +669,77 @@ describe("union schemas render every alternative", () => {
     }
   })
 
+  test("Effect number encodings render as number wherever they appear", () => {
+    const Amount = Schema.Number.annotate({ identifier: "Amount" })
+    const schema = Schema.Struct({
+      plain: Schema.Number,
+      count: Schema.Int,
+      bounded: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 10 })),
+      positive: Schema.Number.check(Schema.isGreaterThan(0)),
+      maybe: Schema.optionalKey(Schema.Number),
+      nullable: Schema.NullOr(Schema.Number),
+      list: Schema.Array(Schema.Number),
+      scores: Schema.Record(Schema.String, Schema.Number),
+      nested: Schema.Struct({ first: Amount, second: Amount }),
+    })
+    const tool = Tool.make({ description: "Numbers", input: schema, output: schema, execute: Effect.succeed })
+    const compact = [
+      "{ plain: number",
+      "count: number",
+      "bounded: number",
+      "positive: number",
+      "maybe?: number",
+      "nullable: number | null",
+      "list: Array<number>",
+      "scores: { [key: string]: number }",
+      "nested: { first: number; second: number } }",
+    ].join("; ")
+    expect(inputTypeScript(tool)).toBe(compact)
+    expect(outputTypeScript(tool)).toBe(compact)
+    for (const rendered of [inputTypeScript(tool, true), outputTypeScript(tool, true)]) {
+      expect(rendered).toContain("  /** @integer */\n  count: number,")
+      expect(rendered).toContain("  /** @integer @minimum 1 @maximum 10 */\n  bounded: number,")
+      expect(rendered).not.toContain("Infinity")
+    }
+    const named = Tool.make({ description: "n", input: Amount, output: Amount, execute: Effect.succeed })
+    expect(inputTypeScript(named)).toBe("number")
+    expect(outputTypeScript(named)).toBe("number")
+  })
+
+  test("explicit non-finite string alternatives stay visible", () => {
+    const literals = ["NaN", "Infinity", "-Infinity"] as const
+    const union = Schema.Union([Schema.Finite, Schema.Literals(literals)])
+    const tool = Tool.make({ description: "n", input: union, output: union, execute: Effect.succeed })
+    expect(inputTypeScript(tool)).toBe('number | "NaN" | "Infinity" | "-Infinity"')
+    expect(outputTypeScript(tool)).toBe('number | "NaN" | "Infinity" | "-Infinity"')
+    for (const value of literals) expect(decodeInput(tool, value)).toBe(value)
+
+    const mixed = Schema.Struct({
+      amount: Schema.Union([Schema.Number, Schema.Literals(literals)]),
+      missing: Schema.Union([Schema.Finite, Schema.Literal("NaN")]),
+    })
+    const mixedTool = Tool.make({ description: "n", input: mixed, output: mixed, execute: Effect.succeed })
+    const rendered = '{ amount: number | "NaN" | "Infinity" | "-Infinity"; missing: number | "NaN" }'
+    expect(inputTypeScript(mixedTool)).toBe(rendered)
+    expect(outputTypeScript(mixedTool)).toBe(rendered)
+    expect(decodeInput(mixedTool, { amount: "-Infinity", missing: "NaN" })).toEqual({
+      amount: "-Infinity",
+      missing: "NaN",
+    })
+
+    const raw = { anyOf: [{ type: "number" }, { type: "string", enum: [...literals] }] }
+    const rawTool = Tool.make({ description: "n", input: raw, output: raw, execute: Effect.succeed })
+    expect(jsonSchemaToTypeScript(raw)).toBe('number | "NaN" | "Infinity" | "-Infinity"')
+    expect(inputTypeScript(rawTool)).toBe('number | "NaN" | "Infinity" | "-Infinity"')
+    expect(outputTypeScript(rawTool)).toBe('number | "NaN" | "Infinity" | "-Infinity"')
+    expect(decodeInput(rawTool, "Infinity")).toBe("Infinity")
+    expect(
+      jsonSchemaToTypeScript({
+        anyOf: [{ type: "number" }, ...literals.map((value) => ({ type: "string", enum: [value] }))],
+      }),
+    ).toBe("number")
+  })
+
   test("keeps unrelated and partial grouped string enums alongside numbers", () => {
     expect(
       jsonSchemaToTypeScript({
