@@ -39,6 +39,30 @@ test("restores review mode and selected file per session", async ({ page }) => {
   await expectSelectedFile(page, "gamma.ts")
 })
 
+test("shows and restores last turn changes from the session diff", async ({ page }) => {
+  await setup(page)
+  await page.route(`**/api/session/${sessionA}/diff**`, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [diff("src/delta.ts")] }),
+    }),
+  )
+  await page.goto(sessionHref(sessionA))
+  await expectSessionTitle(page, titleA)
+  await page.getByRole("button", { name: "Toggle review" }).click()
+
+  await page.getByRole("button", { name: "Git changes" }).click()
+  await page.getByRole("option", { name: "Last turn changes" }).click()
+  await expect(page.getByRole("button", { name: "Last turn changes" })).toBeVisible()
+  await expectSelectedFile(page, "delta.ts")
+
+  await page.reload()
+  await expectSessionTitle(page, titleA)
+  await expect(page.getByRole("button", { name: "Last turn changes" })).toBeVisible()
+  await expectSelectedFile(page, "delta.ts")
+})
+
 for (const tab of ["Context", "Open file", "README.md"]) {
   test(`restores the selected ${tab} pane tab after switching sessions and reloading`, async ({ page }) => {
     await setup(page)

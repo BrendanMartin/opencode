@@ -21,7 +21,6 @@ import { reviewDiffDirectory, reviewDiffNeedsLoad, reviewRootDirectory } from ".
 import type { DiffStyle } from "./review-tab"
 
 export type ChangeMode = "git" | "branch" | "turn"
-type VcsMode = "git" | "branch"
 
 export function createSessionReview(input: {
   session: SessionModel
@@ -64,15 +63,13 @@ export function createSessionReview(input: {
     ) {
       list.push("branch")
     }
+    // Turn diffs compare session snapshots, which the server only captures in Git projects.
+    if (project?.vcs === "git" && input.session.identity.sessionID()) list.push("turn")
     return list
   })
   const mobileChanges = createMemo(
     () => !input.session.isDesktop() && !input.screen.terminal.open() && state.mobileTab === "changes",
   )
-  const vcsMode = createMemo<VcsMode | undefined>(() => {
-    const value = mode()
-    return value === "git" || value === "branch" ? value : undefined
-  })
   const vcsKey = createMemo(
     () =>
       [
@@ -90,22 +87,28 @@ export function createSessionReview(input: {
           (input.session.tabs.activeTab() === "review" || !!input.session.tabs.activeFileTab()))
       : mobileChanges(),
   )
-  const vcsQuery = createQuery(() => {
-    const value = vcsMode()
+  const turnKey = createMemo(() => [server.scope, "session-turn", input.session.identity.sessionID()] as const)
+  const diffQuery = createQuery(() => {
+    const value = mode()
+    const sessionID = input.session.identity.sessionID()
+    const turn = value === "turn"
     return {
-      queryKey: [...vcsKey(), value] as const,
+      queryKey: turn ? turnKey() : ([...vcsKey(), value] as const),
       enabled: server.connection.status() === "connected" && wantsReview() && !!input.session.project()?.vcs,
       refetchOnMount: "always" as const,
-      refetchOnWindowFocus: true,
-      queryFn: value
-        ? () =>
+      // A finished turn's diff is immutable and expensive, so only the idle transition refreshes it.
+      refetchOnWindowFocus: !turn,
+      queryFn: turn
+        ? sessionID
+          ? () => server.api.session.diff({ sessionID })
+          : skipToken
+        : () =>
             server.api.vcs
               .diff({
                 location: { directory: location().directory },
                 mode: value === "git" ? "working" : value,
               })
-              .then((result) => result.data)
-        : skipToken,
+              .then((result) => result.data),
     }
   })
   const detailsQuery = createQuery(() => ({
@@ -136,16 +139,13 @@ export function createSessionReview(input: {
     on(
       () => input.screen.review.open() || mobileChanges(),
       (open, previous) => {
-        if (!open || previous || !input.screen.files.open() || vcsQuery.isFetching) return
+        if (!open || previous || !input.screen.files.open() || diffQuery.isFetching) return
         refresh()
       },
       { defer: true },
     ),
   )
-  const diffs = () => {
-    if (mode() === "git" || mode() === "branch") return vcsQuery.isFetched ? (vcsQuery.data ?? []) : []
-    return []
-  }
+  const diffs = () => (diffQuery.isFetched ? (diffQuery.data ?? []) : [])
   const activeFile = () => {
     const list = diffs()
     const selected = selectedFile()
@@ -155,17 +155,12 @@ export function createSessionReview(input: {
   const count = () => diffs().length
   const hasChanges = () => count() > 0
   const ready = () => {
-    // A project without VCS never enables vcsQuery, so its status stays "pending" forever.
+    // A project without VCS never enables diffQuery, so its status stays "pending" forever.
     const project = input.session.project()
     if (project && !project.vcs) return true
-    if (mode() === "git" || mode() === "branch") return !vcsQuery.isPending
-    return true
+    return !diffQuery.isPending
   }
   const loadDiff = async (path: string, version?: number): Promise<FileDiffInfo | undefined> => {
-    const value = vcsMode()
-    if (!value) return undefined
-    const root = reviewRootDirectory(input.session.project()?.worktree ?? location().directory)
-    const directory = reviewDiffDirectory(root, path)
     const source = diffs().find((diff) => diff.file === path)
     const valid = (diff: FileDiffInfo | undefined): FileDiffInfo | undefined => {
       if (!diff || !source) return undefined
@@ -173,6 +168,26 @@ export function createSessionReview(input: {
       if (reviewDiffNeedsLoad(diff)) return undefined
       return diff
     }
+    const value = mode()
+    // Full-file patches past the server's output budget come back empty; bounded context usually fits.
+    if (value === "turn") {
+      const sessionID = input.session.identity.sessionID()
+      if (!sessionID) return undefined
+      return queryClient
+        .fetchQuery({
+          queryKey: [...turnKey(), "bounded", version] as const,
+          staleTime: Number.POSITIVE_INFINITY,
+          retry: 2,
+          queryFn: () => server.api.session.diff({ sessionID, context: 3 }),
+        })
+        .then((result) => valid(result.find((diff) => diff.file === path)))
+        .catch((error) => {
+          console.debug("[session-review] failed to load bounded turn diff", { path, error })
+          return undefined
+        })
+    }
+    const root = reviewRootDirectory(input.session.project()?.worktree ?? location().directory)
+    const directory = reviewDiffDirectory(root, path)
     const request = (scope: string, context?: number) =>
       queryClient
         .fetchQuery({
@@ -357,6 +372,7 @@ export function createSessionReview(input: {
       (next, previous) => {
         if (next !== "idle" || previous === undefined || previous === "idle") return
         refresh()
+        void queryClient.invalidateQueries({ queryKey: turnKey() })
       },
       { defer: true },
     ),
@@ -402,7 +418,7 @@ export function createSessionReview(input: {
       open: () => state.detailsOpen,
       setOpen: (open: boolean) => setState("detailsOpen", open),
     },
-    diffVersion: () => vcsQuery.dataUpdatedAt,
+    diffVersion: () => diffQuery.dataUpdatedAt,
     diffStyle: {
       current: layout.review.diffStyle,
       set: (style: DiffStyle) => layout.review.setDiffStyle(style),

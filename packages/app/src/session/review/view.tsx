@@ -252,7 +252,6 @@ function ReviewTitle(props: { review: SessionReviewModel }) {
 
 function ReviewEmpty(props: { review: SessionReviewModel; loadingClass: string }) {
   const language = useLanguage()
-  const loading = () => (props.review.mode() === "git" || props.review.mode() === "branch") && !props.review.ready()
   const noGit = () => props.review.noGit()
   const text = () => {
     if (props.review.mode() === "git") return language.t("session.review.noUncommittedChanges")
@@ -261,7 +260,7 @@ function ReviewEmpty(props: { review: SessionReviewModel; loadingClass: string }
   }
   return (
     <Switch>
-      <Match when={loading()}>
+      <Match when={!props.review.ready()}>
         <div class={props.loadingClass}>{language.t("session.review.loadingChanges")}</div>
       </Match>
       <Match when={noGit()}>
@@ -285,11 +284,10 @@ function ReviewEmpty(props: { review: SessionReviewModel; loadingClass: string }
 
 function ReviewPanelEmpty(props: { review: SessionReviewModel }) {
   const language = useLanguage()
-  const loading = () => (props.review.mode() === "git" || props.review.mode() === "branch") && !props.review.ready()
   const noGit = () => props.review.noGit()
   return (
     <Switch>
-      <Match when={loading()}>
+      <Match when={!props.review.ready()}>
         <div class="px-6 py-4 text-text-weak">{language.t("session.review.loadingChanges")}</div>
       </Match>
       <Match when={noGit()}>
