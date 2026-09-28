@@ -1,12 +1,13 @@
-import { Effect, Schema, Stream } from "effect"
+import { Duration, Effect, Schedule, Schema, Stream } from "effect"
 import { Headers, HttpClientRequest, type HttpClientResponse } from "effect/unstable/http"
 import { Auth, type AuthInput } from "./auth.js"
 import { Endpoint } from "./endpoint.js"
 import { RequestExecutorService, type Interface } from "./executor-service.js"
 import { RequestExecutor } from "./executor.js"
 import { MediaProtocol } from "./media-protocol.js"
-import { Generation } from "../generation.js"
+import { Generation, isTerminal } from "../generation.js"
 import type { Media } from "../media.js"
+import { isRetryable } from "../provider-error.js"
 import {
   AIError,
   AIErrorReason,
@@ -137,6 +138,32 @@ export const inline = <Request extends MediaRequest, Response>(
   }
 }
 
+const READ_RETRY_MAX_DELAY = Duration.seconds(30)
+
+/**
+ * Status and result reads retry transient failures; `start` and `cancel` never do. Gaps grow exponentially from 1s,
+ * jittered, up to 30s each, for at most 8 retries (about two minutes when every attempt fails), so a direct
+ * `Generation.result()` stays bounded; `await` and `events` also cut retries off at `poll.timeout`. A provider
+ * `retryAfterMs` raises the gap, still capped at 30s.
+ */
+const READ_RETRY = Schedule.max([
+  Schedule.min([Schedule.exponential("1 second"), Schedule.spaced(READ_RETRY_MAX_DELAY)]),
+  Schedule.recurs(8),
+]).pipe(
+  Schedule.jittered,
+  Schedule.setInputType<AIError>(),
+  Schedule.modifyDelay(({ input, duration }) =>
+    Effect.succeed(
+      Duration.min(
+        input.reason._tag === "RateLimit" || input.reason._tag === "ProviderInternal"
+          ? Duration.max(duration, Duration.millis(input.reason.retryAfterMs ?? 0))
+          : duration,
+        READ_RETRY_MAX_DELAY,
+      ),
+    ),
+  ),
+)
+
 /**
  * Compose a queued media protocol the same way, adding `start`/`resume` handles whose polls reuse the route's auth,
  * deployment headers, and (for `start`) the request's `http` overlay. The token is decoded once at the boundary and
@@ -154,6 +181,8 @@ export const queued = <Request extends MediaRequest, Response, Token>(
   const generationRoute = (token: Token, http: HttpOptions | undefined, execute: Execute) => {
     const materialize = (asset: Media.Asset) =>
       asset.materialize().pipe(Effect.provideService(RequestExecutorService, { execute }))
+    // Only the GET exchange retries: a decoded terminal failure (`output.ended`) can be a `ProviderInternal` too, and
+    // re-reading it would spin until the caller's deadline.
     const poll = <A>(operation: {
       readonly path: (token: Token) => string
       readonly decode: (
@@ -161,17 +190,23 @@ export const queued = <Request extends MediaRequest, Response, Token>(
         context: MediaProtocol.PollContext<Token>,
       ) => Effect.Effect<A, AIError>
     }) =>
-      transport
-        .call("GET", operation.path(token), http, execute)
-        .pipe(Effect.flatMap((sent) => operation.decode(sent.response, { token, auth: sent.auth, materialize })))
+      transport.call("GET", operation.path(token), http, execute).pipe(
+        Effect.retry({ schedule: READ_RETRY, while: isRetryable }),
+        Effect.flatMap((sent) => operation.decode(sent.response, { token, auth: sent.auth, materialize })),
+      )
+    const status = poll(protocol.status)
     const cancel = protocol.cancel
+    const send =
+      cancel === undefined
+        ? undefined
+        : transport.call(cancel.method, cancel.path(token), http, execute).pipe(Effect.asVoid)
     return {
-      status: poll(protocol.status),
+      status,
       result: poll(protocol.result),
       cancel:
-        cancel === undefined
-          ? undefined
-          : transport.call(cancel.method, cancel.path(token), http, execute).pipe(Effect.asVoid),
+        send !== undefined && cancel?.activeOnly
+          ? status.pipe(Effect.flatMap((snapshot) => (isTerminal(snapshot.status) ? Effect.void : send)))
+          : send,
     }
   }
 
@@ -380,7 +415,11 @@ const encode = (body: MediaProtocol.Body | undefined, headers: Headers.Headers) 
   }
 }
 
-/** Common fields are never silently dropped: a present field the protocol declared unsupported fails typed. */
+/**
+ * Common fields are never silently dropped: a present field the protocol declared unsupported fails typed. `false`
+ * counts as present because some booleans mean something when false (video `audio`); protocols reject opt-in
+ * booleans such as speech `timestamps` with `=== true` in `body.from` instead of listing them.
+ */
 const rejectUnsupported = <Request extends object>(
   route: string,
   provider: ProviderID,
