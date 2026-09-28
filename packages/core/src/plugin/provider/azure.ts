@@ -1,4 +1,4 @@
-import { Clock, Effect, FiberHandle, Option, Schedule, Schema, Semaphore, Stream } from "effect"
+import { Clock, Effect, FiberHandle, Option, Schema, Semaphore, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
 import { define } from "@opencode/plugin/effect/plugin"
@@ -352,8 +352,7 @@ export function make(
         yield* ctx.model.reload()
       })
 
-      const refresh = (options?: { readonly onlyIfMissing: boolean }) =>
-        rebind().pipe(Effect.andThen(FiberHandle.run(discovery, discover(), options)))
+      const refresh = () => rebind().pipe(Effect.andThen(FiberHandle.run(discovery, discover())))
 
       // The connection's resource wins for Azure itself, matching the runtime merge of credentials over settings.
       const resourceFor = (provider: Provider.Info) =>
@@ -430,9 +429,9 @@ export function make(
         Stream.runForEach(() => refresh()),
         Effect.forkScoped({ startImmediately: true }),
       )
-      // Deployments load in the background so startup never waits on Azure; the catalog serves until they arrive,
-      // and the last inventory is retained through transient failures.
-      yield* refresh({ onlyIfMissing: true }).pipe(Effect.repeat(Schedule.spaced("5 minutes")), Effect.forkScoped)
+      // Deployments load in the background so startup never waits on Azure; the catalog serves until they arrive.
+      // Later changes load when the connection changes, so a new deployment needs a reconnect or restart.
+      yield* refresh().pipe(Effect.forkScoped)
 
       // Entra bearer tokens are minted per request from the target URL's scope, so they are injected
       // at the transport hooks rather than stored as a credential.

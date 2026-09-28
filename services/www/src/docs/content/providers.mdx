@@ -287,11 +287,11 @@ Instead of configuration, `AZURE_RESOURCE_NAME` supplies the resource name to th
 ### Deployments
 
 Azure serves a model only through a deployment, so OpenCode lists the deployments of your resource and shows those
-instead of the whole Azure catalog. The list loads in the background after startup and after connecting, then refreshes
-every five minutes, so a new deployment appears without a restart.
+instead of the whole Azure catalog. The list loads in the background after startup, after connecting, and after
+switching accounts. To pick up a deployment added later, restart OpenCode or connect again.
 
-- Before the first successful list for a connection, the whole catalog stays available.
-- A temporary refresh failure keeps that connection's last complete inventory.
+- Until the list loads for a connection, or if it fails, the whole catalog stays available.
+- A failed reload for the same connection keeps its last complete inventory.
 - Switching accounts never shows the previous account's inventory; the new account starts from the whole catalog.
 - Deployments inherit limits, costs, and capabilities from their catalog models.
 
