@@ -268,14 +268,18 @@ choose **Microsoft Entra ID (Azure CLI)** when connecting Azure.
 az login
 ```
 
-Enter the resource name when connecting if it is not already supplied by configuration or the environment.
+Enter the resource name when connecting if it is not already supplied by configuration or the environment. A resource
+name saved with a connection takes precedence over configuration; connect again to change it.
 
-For a resource in another tenant or subscription, select both explicitly.
+Each connection keeps the Azure CLI subscription that was selected when it connected, so a later `az account set` does
+not move it. To connect an account in another tenant or subscription, select it before connecting.
 
 ```bash
 az login --tenant TENANT_ID
 az account set --subscription NAME_OR_ID
 ```
+
+Signing in to several accounts with `az login` lets you keep one connection per account and switch between them.
 
 Instead of configuration, `AZURE_RESOURCE_NAME` supplies the resource name to the OpenCode server. The legacy
 `AZURE_COGNITIVE_SERVICES_RESOURCE_NAME` variable also works.
@@ -288,19 +292,20 @@ every five minutes, so a new deployment appears without a restart.
 
 - Before the first successful list for a connection, the whole catalog stays available.
 - A temporary refresh failure keeps that connection's last complete inventory.
-- Switching accounts hides the previous account's inventory until the new connection is loaded.
+- Switching accounts never shows the previous account's inventory; the new account starts from the whole catalog.
 - Deployments inherit limits, costs, and capabilities from their catalog models.
 
 Deployment names are their model IDs. A name matching its catalog model, ignoring case, keeps the catalog ID;
 other names appear as IDs such as `azure/gpt-production`. These IDs stay stable when other deployments are added or
 removed.
 
-OpenCode first tries the resource's legacy deployment inventory with an API key or Entra ID. With the Azure CLI it
-falls back to the Azure management API, which needs read access to the resource. Discovery reads every page before
-publishing the list. A custom `settings.baseURL` keeps the catalog.
+With the Azure CLI, OpenCode lists deployments through the Azure management API, which needs read access to the
+resource. If that fails, and always with an API key, it uses the resource's legacy deployment inventory. Discovery reads
+every page before publishing the list. A custom `settings.baseURL` keeps the catalog.
 
 Configure a deployment explicitly when its model is not in the catalog, such as a fine-tuned model, or to map a model ID
-to a deployment yourself. Explicitly configured models are always kept.
+to a deployment yourself. OpenCode logs a warning naming such deployments. Explicitly configured models are always
+kept.
 
 ```jsonc title="opencode.jsonc"
 {

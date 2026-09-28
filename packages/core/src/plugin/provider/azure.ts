@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schedule, Schema, Semaphore, Stream } from "effect"
+import { Clock, Effect, FiberHandle, Option, Schedule, Schema, Semaphore, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
 import { define } from "@opencode/plugin/effect/plugin"
@@ -20,6 +20,8 @@ const cognitiveScope = "https://cognitiveservices.azure.com/.default"
 const foundryScope = "https://ai.azure.com/.default"
 const managementScope = "https://management.azure.com/.default"
 const methodID = Integration.MethodID.make("azure-cli")
+// The Azure CLI method keeps its subscription in `refresh`, because credential metadata reaches provider settings.
+const refreshPrefix = "azure-cli:"
 // A resource name becomes a hostname label and a query literal, so anything else never leaves the process.
 const resourcePattern = /^[a-zA-Z0-9][a-zA-Z0-9-]*$/
 const decodeJSON = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
@@ -30,6 +32,7 @@ const decodeToken = Schema.decodeUnknownEffect(
     expiresOn: Schema.optional(Schema.NonEmptyString),
   }),
 )
+const decodeSubscription = Schema.decodeUnknownEffect(Schema.Struct({ id: Schema.NonEmptyString }))
 const ResourceDeployments = Schema.Struct({ data: Schema.Array(Schema.Unknown) })
 const decodeResourceDeployment = Schema.decodeUnknownOption(
   Schema.Struct({ id: Schema.NonEmptyString, model: Schema.NonEmptyString, status: Schema.String }),
@@ -47,15 +50,8 @@ const decodeManagementDeployment = Schema.decodeUnknownOption(
     }),
   }),
 )
-const AccountQuery = Schema.Struct({
-  query: Schema.String,
-  options: Schema.optional(Schema.Struct({ $skipToken: Schema.String })),
-})
-const Accounts = Schema.Struct({
-  data: Schema.Array(Schema.Unknown),
-  $skipToken: Schema.optional(Schema.NonEmptyString),
-})
-const decodeAccount = Schema.decodeUnknownOption(Schema.Struct({ id: Schema.NonEmptyString }))
+const ResourceQuery = Schema.Struct({ query: Schema.String })
+const Resources = Schema.Struct({ data: Schema.Array(Schema.Struct({ id: Schema.NonEmptyString })) })
 
 type Deployment = { readonly name: string; readonly model: string }
 
@@ -75,7 +71,10 @@ export function make(
       const providers = yield* Provider.Service
       const http = HttpClient.filterStatusOk(yield* HttpClient.HttpClient)
       const tokens = new Map<string, { access: string; expires: number }>()
+      // A resource keeps its Azure Resource Manager ID until it is deleted, so discovery looks it up once.
+      const resourceIDs = new Map<string, string>()
       const loading = Semaphore.makeUnsafe(1)
+      const discovery = yield* FiberHandle.make<void, never>()
       const loaded: {
         resource?: string
         url?: string
@@ -91,23 +90,30 @@ export function make(
             Effect.flatMap((result) => decodeJSON(result.stdout.toString("utf8"))),
           )
 
-      const token = Effect.fn("AzurePlugin.token")(function* (scope: string) {
+      const token = Effect.fn("AzurePlugin.token")(function* (scope: string, subscription: string | undefined) {
         const now = yield* Clock.currentTimeMillis
-        const cached = tokens.get(scope)
+        const key = `${subscription ?? ""} ${scope}`
+        const cached = tokens.get(key)
         if (cached && cached.expires - now > 5 * 60_000) return cached
-        const result = yield* command(["account", "get-access-token", "--scope", scope, "--output", "json"]).pipe(
-          Effect.flatMap(decodeToken),
-        )
+        const result = yield* command([
+          "account",
+          "get-access-token",
+          "--scope",
+          scope,
+          ...(subscription === undefined ? [] : ["--subscription", subscription]),
+          "--output",
+          "json",
+        ]).pipe(Effect.flatMap(decodeToken))
         const expires = result.expires_on !== undefined ? result.expires_on * 1000 : Date.parse(result.expiresOn ?? "")
         if (!Number.isFinite(expires))
           return yield* Effect.fail(new Error("Azure CLI returned an invalid token expiration"))
         const refreshed = { access: result.accessToken, expires }
-        tokens.set(scope, refreshed)
+        tokens.set(key, refreshed)
         return refreshed
       })
 
-      const management = (request: HttpClientRequest.HttpClientRequest) =>
-        token(managementScope).pipe(
+      const management = (request: HttpClientRequest.HttpClientRequest, subscription: string | undefined) =>
+        token(managementScope, subscription).pipe(
           Effect.flatMap((current) =>
             http.execute(
               request.pipe(
@@ -118,30 +124,6 @@ export function make(
             ),
           ),
         )
-
-      // Resource Graph spans every subscription of the Azure CLI session, unlike a per-subscription account list.
-      const accounts = Effect.fn("AzurePlugin.accounts")(function* (resource: string) {
-        return yield* Stream.paginate(undefined, (skipToken: string | undefined) =>
-          HttpClientRequest.post(
-            `${endpoints.management}/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01`,
-          ).pipe(
-            HttpClientRequest.schemaBodyJson(AccountQuery)({
-              query: accountQuery(resource),
-              ...(skipToken === undefined ? {} : { options: { $skipToken: skipToken } }),
-            }),
-            Effect.flatMap(management),
-            Effect.flatMap(HttpClientResponse.schemaBodyJson(Accounts)),
-            Effect.timeout("10 seconds"),
-            Effect.map(
-              (response) =>
-                [
-                  response.data.flatMap((item) => Option.toArray(decodeAccount(item))),
-                  Option.fromNullishOr(response.$skipToken),
-                ] as const,
-            ),
-          ),
-        ).pipe(Stream.runCollect)
-      })
 
       const available = Boolean(which("az"))
       const form = () =>
@@ -176,25 +158,30 @@ export function make(
             Effect.succeed({
               mode: "auto" as const,
               url: "",
-              instructions: "Sign in with `az login` before continuing.",
+              instructions:
+                "Sign in with `az login` before continuing. The connection keeps the Azure CLI subscription selected now.",
               callback: Effect.gen(function* () {
                 const resourceName =
                   (typeof answer.resourceName === "string" ? answer.resourceName.trim() : "") ||
                   resolveResourceName(configured)
                 if (!resourceName) return yield* Effect.fail(new Error("Azure resource name is required"))
-                const current = yield* token(cognitiveScope)
+                // Pinning the account lets several connections coexist and survive a later `az account set`.
+                const subscription = yield* command(["account", "show", "--output", "json"]).pipe(
+                  Effect.flatMap(decodeSubscription),
+                )
+                const current = yield* token(cognitiveScope, subscription.id)
                 return Credential.OAuth.make({
                   type: "oauth",
                   methodID,
                   access: current.access,
-                  refresh: "azure-cli",
+                  refresh: `${refreshPrefix}${subscription.id}`,
                   expires: current.expires,
                   metadata: { resourceName },
                 })
               }),
             }),
           refresh: (credential) =>
-            token(cognitiveScope).pipe(
+            token(cognitiveScope, credentialSubscription(credential)).pipe(
               Effect.map((current) =>
                 Credential.OAuth.make({ ...credential, access: current.access, expires: current.expires }),
               ),
@@ -211,18 +198,41 @@ export function make(
         return { connection, resource: credentialResource(stored?.value) }
       })
 
-      const managementDeployments = Effect.fn("AzurePlugin.managementDeployments")(function* (resource: string) {
-        const account = (yield* accounts(resource))[0]
-        if (!account) return yield* Effect.fail(new Error(`Azure resource "${resource}" was not found`))
-        return yield* Stream.paginate(
-          `${endpoints.management}${account.id}/deployments?api-version=2024-10-01`,
-          (url) =>
-            management(HttpClientRequest.get(url)).pipe(
-              Effect.flatMap(HttpClientResponse.schemaBodyJson(ManagementDeployments)),
-              Effect.timeout("10 seconds"),
-              Effect.map(
-                (response) =>
-                  [
+      // Resource Graph searches every subscription the Azure CLI account can read, not only the selected one.
+      const findResource = Effect.fn("AzurePlugin.findResource")(function* (
+        resource: string,
+        subscription: string | undefined,
+      ) {
+        const response = yield* HttpClientRequest.post(
+          `${endpoints.management}/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01`,
+        ).pipe(
+          HttpClientRequest.schemaBodyJson(ResourceQuery)({ query: resourceQuery(resource) }),
+          Effect.flatMap((request) => management(request, subscription)),
+          Effect.flatMap(HttpClientResponse.schemaBodyJson(Resources)),
+          Effect.timeout("10 seconds"),
+        )
+        const id = response.data[0]?.id
+        if (!id) return yield* Effect.fail(new Error(`Azure resource "${resource}" was not found`))
+        return id
+      })
+
+      const managementDeployments = Effect.fn("AzurePlugin.managementDeployments")(function* (
+        resource: string,
+        subscription: string | undefined,
+      ) {
+        const key = `${subscription ?? ""} ${resource.toLowerCase()}`
+        const id = resourceIDs.get(key) ?? (yield* findResource(resource, subscription))
+        resourceIDs.set(key, id)
+        const origin = new URL(endpoints.management).origin
+        return yield* Stream.paginate(`${endpoints.management}${id}/deployments?api-version=2024-10-01`, (url) =>
+          management(HttpClientRequest.get(url), subscription).pipe(
+            Effect.flatMap(HttpClientResponse.schemaBodyJson(ManagementDeployments)),
+            Effect.timeout("10 seconds"),
+            Effect.flatMap((response) =>
+              // Every page carries the management token, so a page link must stay on the management endpoint.
+              response.nextLink !== undefined && URL.parse(response.nextLink)?.origin !== origin
+                ? Effect.fail(new Error("Azure returned a deployment page outside the management endpoint"))
+                : Effect.succeed([
                     response.value.flatMap((raw): Deployment[] => {
                       const item = Option.getOrUndefined(decodeManagementDeployment(raw))
                       return item?.properties.provisioningState === "Succeeded"
@@ -230,15 +240,18 @@ export function make(
                         : []
                     }),
                     Option.fromNullishOr(response.nextLink),
-                  ] as const,
-              ),
+                  ] as const),
             ),
-        ).pipe(Stream.runCollect)
+          ),
+        ).pipe(
+          Stream.runCollect,
+          // A moved or recreated resource has a new ID, so the next discovery looks it up again.
+          Effect.tapError(() => Effect.sync(() => resourceIDs.delete(key))),
+        )
       })
 
-      const deployments = Effect.fn("AzurePlugin.deployments")(function* (
+      const resourceDeployments = Effect.fn("AzurePlugin.resourceDeployments")(function* (
         url: string,
-        resource: string,
         credential: Credential.Value,
       ) {
         return yield* http
@@ -260,66 +273,93 @@ export function make(
                 return item?.status === "succeeded" ? [{ name: item.id, model: item.model }] : []
               }),
             ),
-            // Azure documents the management API as the deployment inventory, but only an Azure CLI session can
-            // reach it. The resource's own inventory comes first because it also answers to an API key.
-            Effect.catch((cause) =>
-              credential.type === "oauth" ? managementDeployments(resource) : Effect.fail(cause),
-            ),
           )
       })
 
-      const sync = () =>
+      // Azure documents the management API as the deployment inventory, but only an Azure CLI session can reach it.
+      // The resource's legacy inventory serves API keys and identities without Azure Resource Manager read access.
+      const deployments = (url: string, resource: string, credential: Credential.Value) =>
+        credential.type === "oauth"
+          ? managementDeployments(resource, credentialSubscription(credential)).pipe(
+              Effect.catch(() => resourceDeployments(url, credential)),
+            )
+          : resourceDeployments(url, credential)
+
+      // Local and quick, so a switch rebinds the provider before discovery for the new connection calls Azure.
+      const rebind = () =>
         loading.withPermit(
           Effect.gen(function* () {
             const current = yield* load()
             if (
-              IntegrationConnection.key(current.connection) !== IntegrationConnection.key(loaded.connection) ||
-              current.resource !== loaded.resource
-            ) {
-              Object.assign(loaded, current, { url: undefined, deployments: undefined })
-              yield* ctx.provider.reload()
-            }
-            const settings = (yield* providers.get(Provider.ID.azure))?.settings
-            const name = loaded.resource ?? resolveResourceName(settings)
-            // A custom endpoint may expose other deployments than the resource does, so it keeps the catalog.
-            const url =
-              current.connection &&
-              name !== undefined &&
-              resourcePattern.test(name) &&
-              typeof settings?.baseURL !== "string"
-                ? `${endpoints.resource(name)}/deployments?api-version=2022-12-01`
-                : undefined
-            // Keep the last inventory through transient failures only for the same connection and resource.
-            if (loaded.url !== url) {
-              loaded.url = url
-              if (loaded.deployments) {
-                loaded.deployments = undefined
-                yield* ctx.model.reload()
-              }
-            }
-            if (!current.connection || !name || !url) return
-            const credential = yield* ctx.integration.connection
-              .resolve(current.connection)
-              .pipe(Effect.orElseSucceed(() => undefined))
-            if (!credential || (credential.type === "oauth" && credential.methodID !== methodID)) return
-            const found = yield* deployments(url, name, credential).pipe(
-              // Azure promises no order; normalize it so a reordered response does not rebuild the model list.
-              Effect.map((list) => list.toSorted((a, b) => a.name.localeCompare(b.name))),
-              Effect.catch((cause) =>
-                Effect.logWarning("failed to sync Azure deployments", { cause }).pipe(Effect.as(undefined)),
-              ),
-            )
-            if (!found) return
-            if (
-              IntegrationConnection.key(current.connection) !==
-              IntegrationConnection.key(yield* ctx.integration.connection.active(Provider.ID.azure))
+              IntegrationConnection.key(current.connection) === IntegrationConnection.key(loaded.connection) &&
+              current.resource === loaded.resource
             )
               return
-            if (JSON.stringify(found) === JSON.stringify(loaded.deployments)) return
-            loaded.deployments = found
-            yield* ctx.model.reload()
+            Object.assign(loaded, current, { url: undefined, deployments: undefined })
+            yield* ctx.provider.reload()
           }),
         )
+
+      const discover = Effect.fn("AzurePlugin.discover")(function* () {
+        const connection = loaded.connection
+        const settings = (yield* providers.get(Provider.ID.azure))?.settings
+        const name = loaded.resource ?? resolveResourceName(settings)
+        // A custom endpoint may expose other deployments than the resource does, so it keeps the catalog.
+        const url =
+          connection && name !== undefined && resourcePattern.test(name) && typeof settings?.baseURL !== "string"
+            ? `${endpoints.resource(name)}/deployments?api-version=2022-12-01`
+            : undefined
+        if (loaded.connection !== connection) return
+        // Keep the last inventory through transient failures only for the same connection and resource.
+        if (loaded.url !== url) {
+          loaded.url = url
+          if (loaded.deployments) {
+            loaded.deployments = undefined
+            yield* ctx.model.reload()
+          }
+        }
+        if (!connection || !name || !url) return
+        const credential = yield* ctx.integration.connection
+          .resolve(connection)
+          .pipe(Effect.orElseSucceed(() => undefined))
+        if (!credential || (credential.type === "oauth" && credential.methodID !== methodID)) return
+        const found = yield* deployments(url, name, credential).pipe(
+          // Azure promises no order; normalize it so a reordered response does not rebuild the model list.
+          Effect.map((list) => list.toSorted((a, b) => a.name.localeCompare(b.name))),
+          Effect.catch((cause) =>
+            Effect.logWarning("failed to sync Azure deployments", { cause }).pipe(Effect.as(undefined)),
+          ),
+        )
+        if (!found) return
+        if (
+          loaded.connection !== connection ||
+          IntegrationConnection.key(connection) !==
+            IntegrationConnection.key(yield* ctx.integration.connection.active(Provider.ID.azure))
+        )
+          return
+        if (JSON.stringify(found) === JSON.stringify(loaded.deployments)) return
+        const catalog = new Set(
+          Array.from((yield* providers.snapshot()).records.get(Provider.ID.azure)?.models.keys() ?? [], (id) =>
+            id.toLowerCase(),
+          ),
+        )
+        const unmatched = found.filter((deployment) => !catalog.has(deployment.model.toLowerCase()))
+        if (unmatched.length > 0)
+          yield* Effect.logWarning("Azure deployments of models outside the catalog need explicit configuration", {
+            deployments: unmatched.map((deployment) => deployment.name),
+          })
+        loaded.deployments = found
+        yield* ctx.model.reload()
+      })
+
+      const refresh = (options?: { readonly onlyIfMissing: boolean }) =>
+        rebind().pipe(Effect.andThen(FiberHandle.run(discovery, discover(), options)))
+
+      // The connection's resource wins for Azure itself, matching the runtime merge of credentials over settings.
+      const resourceFor = (provider: Provider.Info) =>
+        provider.id === Provider.ID.azure
+          ? (loaded.resource ?? resolveResourceName(provider.settings))
+          : resolveResourceName(provider.settings, loaded.resource)
 
       Object.assign(loaded, yield* load())
       yield* ctx.provider.transform((evt) => {
@@ -329,7 +369,7 @@ export function make(
             !item.provider.package.startsWith("@opencode/ai/providers/azure/")
           )
             continue
-          const resourceName = resolveResourceName(item.provider.settings, loaded.resource)
+          const resourceName = resourceFor(item.provider)
           const websocket = responsesWebSocketCapable(item.provider)
           if (!resourceName && !websocket) continue
           evt.update(item.provider.id, (provider) => {
@@ -345,7 +385,7 @@ export function make(
         }
         const item = evt.get(Provider.ID.azure)
         if (!item) return
-        // Bind resource settings and discovery to their account, so a switch hides them even while sync is busy.
+        // Bind resource settings and discovery to their account, so a switch hides them until the rebind.
         // Keep the full templates here for explicit configuration; the model transform narrows the visible list.
         evt.add({
           info: item.provider,
@@ -360,7 +400,7 @@ export function make(
             !item.provider.package.startsWith("@opencode/ai/providers/azure/")
           )
             continue
-          const resourceName = resolveResourceName(item.provider.settings, loaded.resource)
+          const resourceName = resourceFor(item.provider)
           for (const model of models.list(item.provider.id)) {
             models.update(item.provider.id, model.id, (draft) => {
               if (resourceName && typeof draft.settings?.baseURL === "string")
@@ -384,14 +424,15 @@ export function make(
         }
       })
 
+      // A switch interrupts discovery for the previous connection instead of waiting for its Azure calls.
       yield* bus.subscribe(Credential.Event.Switched).pipe(
         Stream.filter((event) => event.data.integrationID === Integration.ID.make("azure")),
-        Stream.runForEach(sync),
+        Stream.runForEach(() => refresh()),
         Effect.forkScoped({ startImmediately: true }),
       )
       // Deployments load in the background so startup never waits on Azure; the catalog serves until they arrive,
       // and the last inventory is retained through transient failures.
-      yield* sync().pipe(Effect.repeat(Schedule.spaced("5 minutes")), Effect.forkScoped)
+      yield* refresh({ onlyIfMissing: true }).pipe(Effect.repeat(Schedule.spaced("5 minutes")), Effect.forkScoped)
 
       // Entra bearer tokens are minted per request from the target URL's scope, so they are injected
       // at the transport hooks rather than stored as a credential.
@@ -406,7 +447,7 @@ export function make(
           target.hostname.endsWith(".services.ai.azure.com") && !target.pathname.startsWith("/models")
             ? foundryScope
             : cognitiveScope
-        const current = yield* token(scope).pipe(Effect.orDie)
+        const current = yield* token(scope, credentialSubscription(credential)).pipe(Effect.orDie)
         return `Bearer ${current.access}`
       })
       yield* ctx.session.hook(
@@ -466,15 +507,21 @@ function credentialResource(credential: Credential.Value | undefined) {
   return typeof resource === "string" && resource.trim() !== "" ? resource : undefined
 }
 
-function accountQuery(resource: string) {
+// Connections made before subscriptions were pinned store only the method name and follow the Azure CLI default.
+function credentialSubscription(credential: { readonly refresh: string }) {
+  return credential.refresh.startsWith(refreshPrefix) ? credential.refresh.slice(refreshPrefix.length) : undefined
+}
+
+function resourceQuery(resource: string) {
   return [
     "resources",
     "| where type =~ 'microsoft.cognitiveservices/accounts' and kind in~ ('AIServices', 'OpenAI')",
     // The custom subdomain is the resource name of every endpoint, and Entra ID authentication requires one.
+    // Subdomains are globally unique, so a name matches at most one resource.
     "| extend resourceName = tostring(properties.customSubDomainName)",
     `| where resourceName =~ '${resource}'`,
     "| project id",
-    "| order by id asc",
+    "| take 1",
   ].join(" ")
 }
 
