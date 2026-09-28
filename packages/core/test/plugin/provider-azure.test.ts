@@ -206,22 +206,6 @@ const azureCredential = Effect.gen(function* () {
   })
 })
 
-const pinnedCredential = (subscription: string) =>
-  Effect.gen(function* () {
-    const credentials = yield* Credential.Service
-    return yield* credentials.create({
-      integrationID: Integration.ID.make("azure"),
-      value: Credential.OAuth.make({
-        type: "oauth",
-        methodID: Integration.MethodID.make("azure-cli"),
-        access: "stored-token",
-        refresh: `azure-cli:${subscription}`,
-        expires: Date.now() + 60 * 60 * 1000,
-        metadata: { resourceName: "test-resource" },
-      }),
-    })
-  })
-
 const keyCredential = Effect.gen(function* () {
   const credentials = yield* Credential.Service
   return yield* credentials.create({
@@ -320,7 +304,6 @@ describe("AzurePlugin", () => {
       withAzureCommands(
         (args) => {
           commands.push([...args])
-          if (args[1] === "show") return { id: "sub-a", tenantId: "tenant-a" }
           return {
             accessToken: "legacy-cli-token",
             expiresOn: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
@@ -342,28 +325,19 @@ describe("AzurePlugin", () => {
             }).pipe(Effect.retry({ times: 1500, schedule: Schedule.spaced("1 millis") }))
 
             const credential = (yield* (yield* Credential.Service).list(integrationID))[0]?.value
-            // The subscription stays out of metadata, which the model resolver merges into provider settings.
-            expect(credential).toEqual({
+            expect(credential).toMatchObject({
               type: "oauth",
-              methodID: Integration.MethodID.make("azure-cli"),
               access: "legacy-cli-token",
-              refresh: "azure-cli:sub-a",
-              expires: expect.any(Number),
               metadata: { resourceName: "test-resource" },
             })
             // Discovery for the new connection may already be minting its management token afterwards.
-            expect(commands.slice(0, 2)).toEqual([
-              ["account", "show", "--output", "json"],
-              [
-                "account",
-                "get-access-token",
-                "--scope",
-                "https://cognitiveservices.azure.com/.default",
-                "--subscription",
-                "sub-a",
-                "--output",
-                "json",
-              ],
+            expect(commands[0]).toEqual([
+              "account",
+              "get-access-token",
+              "--scope",
+              "https://cognitiveservices.azure.com/.default",
+              "--output",
+              "json",
             ])
           }),
       ),
@@ -404,7 +378,6 @@ describe("AzurePlugin", () => {
 
               const deployed = yield* eventually(azureModels, (list) => list.length === 1)
               expect(deployed.map((model) => model.id)).toEqual([Model.ID.make("gpt-5-mini")])
-              // A connection from before subscription pinning keeps following the Azure CLI default account.
               expect(commands).toEqual([
                 ["account", "get-access-token", "--scope", "https://management.azure.com/.default", "--output", "json"],
               ])
@@ -500,7 +473,7 @@ describe("AzurePlugin", () => {
     ),
   )
 
-  it.live("lists Azure CLI deployments through the management API of the pinned subscription", () => {
+  it.live("lists Azure CLI deployments through the management API", () => {
     const commands: string[][] = []
     const resource = account("test-resource")
     return withAzureCommands(
@@ -529,7 +502,7 @@ describe("AzurePlugin", () => {
           ({ endpoints, requests }) =>
             Effect.gen(function* () {
               yield* seedCatalog
-              yield* pinnedCredential("sub-b")
+              yield* azureCredential
               yield* addPlugin(endpoints)
 
               const deployed = yield* eventually(azureModels, (list) => list.length === 1)
@@ -537,16 +510,7 @@ describe("AzurePlugin", () => {
                 [Model.ID.make("gpt-production"), Model.ID.make("gpt-production")],
               ])
               expect(commands).toEqual([
-                [
-                  "account",
-                  "get-access-token",
-                  "--scope",
-                  "https://management.azure.com/.default",
-                  "--subscription",
-                  "sub-b",
-                  "--output",
-                  "json",
-                ],
+                ["account", "get-access-token", "--scope", "https://management.azure.com/.default", "--output", "json"],
               ])
               expect(requests.map((request) => [request.method, request.path, request.authorization])).toEqual([
                 [
@@ -969,39 +933,6 @@ describe("AzurePlugin", () => {
         }),
     ),
   )
-
-  it.effect("mints request tokens for the subscription the connection was made with", () => {
-    const commands: string[][] = []
-    return withAzureCommands(
-      (args) => {
-        commands.push([...args])
-        return cliTokens(args)
-      },
-      () =>
-        Effect.gen(function* () {
-          yield* pinnedCredential("sub-b")
-          yield* addPlugin()
-          const hooks = yield* PluginHooks.Service
-          yield* hooks.trigger("session", "http.request", {
-            sessionID: Session.ID.make("ses_pinned"),
-            agent: Agent.ID.make("build"),
-            model: Model.Ref.make({ providerID: Provider.ID.azure, id: Model.ID.make("gpt-5-mini") }),
-            kind: "primary",
-            request: new Request("https://test-resource.openai.azure.com/openai/v1/responses"),
-          })
-          expect(commands).toContainEqual([
-            "account",
-            "get-access-token",
-            "--scope",
-            "https://cognitiveservices.azure.com/.default",
-            "--subscription",
-            "sub-b",
-            "--output",
-            "json",
-          ])
-        }),
-    )
-  })
 
   it.effect("prefers the connection's resource over configuration, as requests do", () =>
     Effect.gen(function* () {

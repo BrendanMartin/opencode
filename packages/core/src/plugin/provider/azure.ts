@@ -20,8 +20,6 @@ const cognitiveScope = "https://cognitiveservices.azure.com/.default"
 const foundryScope = "https://ai.azure.com/.default"
 const managementScope = "https://management.azure.com/.default"
 const methodID = Integration.MethodID.make("azure-cli")
-// The Azure CLI method keeps its subscription in `refresh`, because credential metadata reaches provider settings.
-const refreshPrefix = "azure-cli:"
 // A resource name becomes a hostname label and a query literal, so anything else never leaves the process.
 const resourcePattern = /^[a-zA-Z0-9][a-zA-Z0-9-]*$/
 const decodeJSON = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
@@ -32,7 +30,6 @@ const decodeToken = Schema.decodeUnknownEffect(
     expiresOn: Schema.optional(Schema.NonEmptyString),
   }),
 )
-const decodeSubscription = Schema.decodeUnknownEffect(Schema.Struct({ id: Schema.NonEmptyString }))
 const ResourceDeployments = Schema.Struct({ data: Schema.Array(Schema.Unknown) })
 const decodeResourceDeployment = Schema.decodeUnknownOption(
   Schema.Struct({ id: Schema.NonEmptyString, model: Schema.NonEmptyString, status: Schema.String }),
@@ -90,30 +87,23 @@ export function make(
             Effect.flatMap((result) => decodeJSON(result.stdout.toString("utf8"))),
           )
 
-      const token = Effect.fn("AzurePlugin.token")(function* (scope: string, subscription: string | undefined) {
+      const token = Effect.fn("AzurePlugin.token")(function* (scope: string) {
         const now = yield* Clock.currentTimeMillis
-        const key = `${subscription ?? ""} ${scope}`
-        const cached = tokens.get(key)
+        const cached = tokens.get(scope)
         if (cached && cached.expires - now > 5 * 60_000) return cached
-        const result = yield* command([
-          "account",
-          "get-access-token",
-          "--scope",
-          scope,
-          ...(subscription === undefined ? [] : ["--subscription", subscription]),
-          "--output",
-          "json",
-        ]).pipe(Effect.flatMap(decodeToken))
+        const result = yield* command(["account", "get-access-token", "--scope", scope, "--output", "json"]).pipe(
+          Effect.flatMap(decodeToken),
+        )
         const expires = result.expires_on !== undefined ? result.expires_on * 1000 : Date.parse(result.expiresOn ?? "")
         if (!Number.isFinite(expires))
           return yield* Effect.fail(new Error("Azure CLI returned an invalid token expiration"))
         const refreshed = { access: result.accessToken, expires }
-        tokens.set(key, refreshed)
+        tokens.set(scope, refreshed)
         return refreshed
       })
 
-      const management = (request: HttpClientRequest.HttpClientRequest, subscription: string | undefined) =>
-        token(managementScope, subscription).pipe(
+      const management = (request: HttpClientRequest.HttpClientRequest) =>
+        token(managementScope).pipe(
           Effect.flatMap((current) =>
             http.execute(
               request.pipe(
@@ -158,30 +148,25 @@ export function make(
             Effect.succeed({
               mode: "auto" as const,
               url: "",
-              instructions:
-                "Sign in with `az login` before continuing. The connection keeps the Azure CLI subscription selected now.",
+              instructions: "Sign in with `az login` before continuing.",
               callback: Effect.gen(function* () {
                 const resourceName =
                   (typeof answer.resourceName === "string" ? answer.resourceName.trim() : "") ||
                   resolveResourceName(configured)
                 if (!resourceName) return yield* Effect.fail(new Error("Azure resource name is required"))
-                // Pinning the account lets several connections coexist and survive a later `az account set`.
-                const subscription = yield* command(["account", "show", "--output", "json"]).pipe(
-                  Effect.flatMap(decodeSubscription),
-                )
-                const current = yield* token(cognitiveScope, subscription.id)
+                const current = yield* token(cognitiveScope)
                 return Credential.OAuth.make({
                   type: "oauth",
                   methodID,
                   access: current.access,
-                  refresh: `${refreshPrefix}${subscription.id}`,
+                  refresh: "azure-cli",
                   expires: current.expires,
                   metadata: { resourceName },
                 })
               }),
             }),
           refresh: (credential) =>
-            token(cognitiveScope, credentialSubscription(credential)).pipe(
+            token(cognitiveScope).pipe(
               Effect.map((current) =>
                 Credential.OAuth.make({ ...credential, access: current.access, expires: current.expires }),
               ),
@@ -199,15 +184,12 @@ export function make(
       })
 
       // Resource Graph searches every subscription the Azure CLI account can read, not only the selected one.
-      const findResource = Effect.fn("AzurePlugin.findResource")(function* (
-        resource: string,
-        subscription: string | undefined,
-      ) {
+      const findResource = Effect.fn("AzurePlugin.findResource")(function* (resource: string) {
         const response = yield* HttpClientRequest.post(
           `${endpoints.management}/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01`,
         ).pipe(
           HttpClientRequest.schemaBodyJson(ResourceQuery)({ query: resourceQuery(resource) }),
-          Effect.flatMap((request) => management(request, subscription)),
+          Effect.flatMap(management),
           Effect.flatMap(HttpClientResponse.schemaBodyJson(Resources)),
           Effect.timeout("10 seconds"),
         )
@@ -216,16 +198,13 @@ export function make(
         return id
       })
 
-      const managementDeployments = Effect.fn("AzurePlugin.managementDeployments")(function* (
-        resource: string,
-        subscription: string | undefined,
-      ) {
-        const key = `${subscription ?? ""} ${resource.toLowerCase()}`
-        const id = resourceIDs.get(key) ?? (yield* findResource(resource, subscription))
+      const managementDeployments = Effect.fn("AzurePlugin.managementDeployments")(function* (resource: string) {
+        const key = resource.toLowerCase()
+        const id = resourceIDs.get(key) ?? (yield* findResource(resource))
         resourceIDs.set(key, id)
         const origin = new URL(endpoints.management).origin
         return yield* Stream.paginate(`${endpoints.management}${id}/deployments?api-version=2024-10-01`, (url) =>
-          management(HttpClientRequest.get(url), subscription).pipe(
+          management(HttpClientRequest.get(url)).pipe(
             Effect.flatMap(HttpClientResponse.schemaBodyJson(ManagementDeployments)),
             Effect.timeout("10 seconds"),
             Effect.flatMap((response) =>
@@ -280,7 +259,7 @@ export function make(
       // The resource's legacy inventory serves API keys and identities without Azure Resource Manager read access.
       const deployments = (url: string, resource: string, credential: Credential.Value) =>
         credential.type === "oauth"
-          ? managementDeployments(resource, credentialSubscription(credential)).pipe(
+          ? managementDeployments(resource).pipe(
               Effect.catch(() => resourceDeployments(url, credential)),
             )
           : resourceDeployments(url, credential)
@@ -446,7 +425,7 @@ export function make(
           target.hostname.endsWith(".services.ai.azure.com") && !target.pathname.startsWith("/models")
             ? foundryScope
             : cognitiveScope
-        const current = yield* token(scope, credentialSubscription(credential)).pipe(Effect.orDie)
+        const current = yield* token(scope).pipe(Effect.orDie)
         return `Bearer ${current.access}`
       })
       yield* ctx.session.hook(
@@ -504,11 +483,6 @@ function credentialResource(credential: Credential.Value | undefined) {
         ? credential.metadata?.resourceName
         : undefined
   return typeof resource === "string" && resource.trim() !== "" ? resource : undefined
-}
-
-// Connections made before subscriptions were pinned store only the method name and follow the Azure CLI default.
-function credentialSubscription(credential: { readonly refresh: string }) {
-  return credential.refresh.startsWith(refreshPrefix) ? credential.refresh.slice(refreshPrefix.length) : undefined
 }
 
 function resourceQuery(resource: string) {

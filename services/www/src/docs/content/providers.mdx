@@ -271,15 +271,13 @@ az login
 Enter the resource name when connecting if it is not already supplied by configuration or the environment. A resource
 name saved with a connection takes precedence over configuration; connect again to change it.
 
-Each connection keeps the Azure CLI subscription that was selected when it connected, so a later `az account set` does
-not move it. To connect an account in another tenant or subscription, select it before connecting.
+Azure CLI connections use the account selected in the Azure CLI. For a resource in another tenant or subscription,
+select both explicitly.
 
 ```bash
 az login --tenant TENANT_ID
 az account set --subscription NAME_OR_ID
 ```
-
-Signing in to several accounts with `az login` lets you keep one connection per account and switch between them.
 
 Instead of configuration, `AZURE_RESOURCE_NAME` supplies the resource name to the OpenCode server. The legacy
 `AZURE_COGNITIVE_SERVICES_RESOURCE_NAME` variable also works.
