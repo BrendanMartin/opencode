@@ -2494,6 +2494,7 @@ export type PermissionClassificationDetails = {
 
 export type PermissionClassificationResult = {
   approved: boolean
+  denied?: boolean
   details?: PermissionClassificationDetails
 }
 

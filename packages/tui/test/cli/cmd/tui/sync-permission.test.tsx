@@ -154,6 +154,27 @@ describe("tui model-gated permission review mode", () => {
     }
   })
 
+  test("a Jev denial rejects the action without opening the permission dialog", async () => {
+    let reply: unknown
+    const mounted = await mount(async (url, request) => {
+      if (url.pathname.endsWith("/classify")) return json({ approved: false, denied: true })
+      if (url.pathname.endsWith("/reply")) {
+        reply = await request.json()
+        return json(true)
+      }
+    })
+
+    try {
+      mounted.permission.set("review")
+      mounted.emit(asked(permission("per_denied")))
+      await wait(() => reply !== undefined)
+      expect(reply).toEqual({ reply: "reject" })
+      expect(mounted.sync.data.permission.ses_auto).toBeUndefined()
+    } finally {
+      mounted.app.renderer.destroy()
+    }
+  })
+
   test("negative, classifier error, and reply error all recover the normal dialog", async () => {
     const mounted = await mount((url) => {
       if (url.pathname.includes("per_negative") && url.pathname.endsWith("/classify")) return json({ approved: false })

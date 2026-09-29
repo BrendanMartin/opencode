@@ -66,6 +66,7 @@ export type ClassificationDetails = typeof ClassificationDetails.Type
 
 export const ClassificationResult = Schema.Struct({
   approved: Schema.Boolean,
+  denied: Schema.optional(Schema.Boolean),
   details: Schema.optional(ClassificationDetails),
 }).annotate({ identifier: "PermissionClassificationResult" })
 export type ClassificationResult = typeof ClassificationResult.Type

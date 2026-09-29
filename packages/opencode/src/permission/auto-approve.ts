@@ -4,11 +4,14 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Context, Deferred, Effect, Layer, Stream } from "effect"
 import { Config } from "@/config/config"
+import { Auth } from "@/auth"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { Session } from "@/session/session"
 import type { Agent } from "@/agent/agent"
 import PROMPT from "./auto-approve.txt"
+export { jevDecision } from "./auto-approve-jev"
+import { jevDecision } from "./auto-approve-jev"
 
 export const policy = PROMPT
 
@@ -362,6 +365,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const llm = yield* LLM.Service
     const session = yield* Session.Service
+    const auth = yield* Auth.Service
     const active = new WeakMap<PermissionV1.Request, Deferred.Deferred<PermissionV1.ClassificationResult>>()
 
     const run = Effect.fn("PermissionAutoApprove.classify")(function* (request: PermissionV1.Request) {
@@ -392,6 +396,43 @@ const layer = Layer.effect(
       const history = yield* session.messages({ sessionID: request.sessionID })
       const context = evidence(request, history)
       if (!context) return unavailable("not_classifiable")
+
+      if (cfg.auto_approve?.backend === "jev") {
+        const credential = yield* auth.get("typesafe")
+        if (credential?.type !== "api" || !credential.key) return unavailable("missing_jev_key")
+        const model = cfg.auto_approve.jev?.model ?? "jev-latest"
+        if (!model.trim()) return unavailable("invalid_jev_model")
+        const configured = cfg.auto_approve.jev
+        const decision = yield* Effect.tryPromise({
+          try: (signal) =>
+            jevDecision(context.input, credential.key, model, signal, fetch, {
+              instructions: configured?.instructions,
+              criteria: configured?.criteria,
+              minProbability: configured?.min_probability,
+            }),
+          catch: () => new Error("Jev classification unavailable"),
+        })
+        const outcome = decision.outcome === "unavailable" ? "ASK" : decision.outcome.toUpperCase()
+        yield* Effect.logInfo("auto-approve classification", {
+          requestID: request.id,
+          sessionID: request.sessionID,
+          providerID: "typesafe",
+          modelID: model,
+          decision: outcome,
+        })
+        return {
+          approved: decision.outcome === "approve",
+          denied: decision.outcome === "deny",
+          ...(detailed
+            ? {
+                details: {
+                  input: JSON.stringify(context.input),
+                  output: decision.probabilities ? `${outcome} ${JSON.stringify(decision.probabilities)}` : outcome,
+                },
+              }
+            : {}),
+        }
+      }
 
       const hasConfigured = cfg.auto_approve !== undefined && Object.hasOwn(cfg.auto_approve, "model")
       const configuredValue = cfg.auto_approve?.model
@@ -453,7 +494,8 @@ const layer = Layer.effect(
       const text = output(events)
       // approved() rejects reasoning outright, so without this the trace would read
       // "AUTO_APPROVE" next to a refusal.
-      const rejected = !decision && reasoning(events) && text.trim() === "AUTO_APPROVE" ? "(rejected: reasoning_output)" : undefined
+      const rejected =
+        !decision && reasoning(events) && text.trim() === "AUTO_APPROVE" ? "(rejected: reasoning_output)" : undefined
       yield* Effect.logInfo("auto-approve classification", {
         requestID: request.id,
         sessionID: request.sessionID,
@@ -478,9 +520,7 @@ const layer = Layer.effect(
           Effect.catchCause(() => Effect.succeed(false)),
         )
         return (
-          detailed
-            ? { approved: false, details: { input: "", output: `(failed: ${category})` } }
-            : { approved: false }
+          detailed ? { approved: false, details: { input: "", output: `(failed: ${category})` } } : { approved: false }
         ) satisfies PermissionV1.ClassificationResult
       })
 
@@ -508,7 +548,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [Config.node, Provider.node, LLM.node, Session.node],
+  deps: [Config.node, Provider.node, LLM.node, Session.node, Auth.node],
 })
 
 export * as PermissionAutoApprove from "./auto-approve"
