@@ -2700,6 +2700,14 @@ export type WorktreeError = {
 export const isWorktreeError = (value: unknown): value is WorktreeError =>
   typeof value === "object" && value !== null && "name" in value && value["name"] === "WorktreeError"
 
+export type VcsInitNotSupportedError = {
+  readonly _tag: "VcsInitNotSupportedError"
+  readonly providerID: string
+  readonly message: string
+}
+export const isVcsInitNotSupportedError = (value: unknown): value is VcsInitNotSupportedError =>
+  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "VcsInitNotSupportedError"
+
 export type ServerInfoOutput = ServerInfo
 
 export type ServerPairOutput = PairingCode

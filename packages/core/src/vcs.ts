@@ -22,7 +22,7 @@ export class DiffError extends Schema.TaggedError<DiffError>()("Vcs.DiffError", 
 }) {}
 
 export class InitializeError extends Schema.TaggedError<InitializeError>()("Vcs.InitializeError", {
-  kind: Schema.Literals(["missing", "conflict", "unsupported", "failed"]),
+  kind: Schema.Literals(["missing", "conflict", "unknown", "unsupported", "failed"]),
 }) {}
 
 export interface DiffOptions {
@@ -178,7 +178,8 @@ const layer = Layer.effect(
         if (!(yield* fs.isDir(location.project.directory))) return yield* new InitializeError({ kind: "missing" })
         if (yield* Project.root(fs, location.project.directory)) return yield* new InitializeError({ kind: "conflict" })
         const provider = state.get().providers.get(providerID)
-        if (!provider?.init) return yield* new InitializeError({ kind: "unsupported" })
+        if (!provider) return yield* new InitializeError({ kind: "unknown" })
+        if (!provider.init) return yield* new InitializeError({ kind: "unsupported" })
         yield* provider
           .init(scope)
           .pipe(

@@ -117,7 +117,7 @@ describe("Vcs", () => {
             }),
           )
         })
-        expect(yield* vcs.initialize("missing").pipe(Effect.flip)).toMatchObject({ kind: "unsupported" })
+        expect(yield* vcs.initialize("missing").pipe(Effect.flip)).toMatchObject({ kind: "unknown" })
         expect(yield* vcs.initialize("read-only").pipe(Effect.flip)).toMatchObject({ kind: "unsupported" })
         expect(calls).toEqual([])
         yield* vcs.initialize("custom")

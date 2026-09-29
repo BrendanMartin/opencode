@@ -12,6 +12,12 @@ const InitQuery = Schema.Struct({
   provider: Schema.optional(Schema.String),
 })
 
+export class VcsInitNotSupportedError extends Schema.TaggedError<VcsInitNotSupportedError>()(
+  "VcsInitNotSupportedError",
+  { providerID: Schema.String, message: Schema.String },
+  { httpApiStatus: 501 },
+) {}
+
 const BranchesQuery = Schema.Struct({
   ...LocationQuery.fields,
   search: Schema.optional(Schema.String),
@@ -30,7 +36,7 @@ export const VcsGroup = HttpApiGroup.make("server.vcs")
     HttpApiEndpoint.post("vcs.init", "/api/vcs/init", {
       query: InitQuery,
       success: HttpApiSchema.NoContent,
-      error: [ConflictError, InvalidRequestError, ServiceUnavailableError],
+      error: [ConflictError, InvalidRequestError, VcsInitNotSupportedError, ServiceUnavailableError],
     })
       .annotateMerge(locationQueryOpenApi)
       .annotateMerge(
@@ -38,7 +44,7 @@ export const VcsGroup = HttpApiGroup.make("server.vcs")
           identifier: "vcs.init",
           summary: "Initialize VCS repository",
           description:
-            "Initialize a repository using the selected VCS provider in a markerless project's directory and refresh its location services. Omitting provider defaults to git; built-in git and hg providers support initialization.",
+            "Initialize a repository using the selected VCS provider in a markerless project's directory and refresh its location services. Omitting provider defaults to git; built-in git and hg providers support initialization. An unknown provider returns 400; a registered provider without init returns 501.",
         }),
       ),
   )

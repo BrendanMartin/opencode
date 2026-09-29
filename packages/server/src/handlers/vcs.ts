@@ -4,6 +4,7 @@ import { Plugin } from "@opencode/core/plugin"
 import { Location } from "@opencode/core/location"
 import { LocationServiceMap } from "@opencode/core/location-services"
 import { ConflictError, InvalidRequestError, ServiceUnavailableError } from "@opencode/protocol/errors"
+import { VcsInitNotSupportedError } from "@opencode/protocol/groups/vcs"
 import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
@@ -27,10 +28,15 @@ export const VcsHandler = HttpApiBuilder.group(Api, "server.vcs", (handlers) =>
                 return new InvalidRequestError({ message: "Project directory does not exist", field: "location" })
               if (error.kind === "conflict")
                 return new ConflictError({ message: "Project already has version control", resource: directory })
-              if (error.kind === "unsupported")
+              if (error.kind === "unknown")
                 return new InvalidRequestError({
-                  message: "VCS provider does not support initialization",
+                  message: "Unknown VCS provider",
                   field: "provider",
+                })
+              if (error.kind === "unsupported")
+                return new VcsInitNotSupportedError({
+                  providerID,
+                  message: "VCS provider does not support initialization",
                 })
               return new ServiceUnavailableError({ service: providerID, message: "VCS initialization failed" })
             }),

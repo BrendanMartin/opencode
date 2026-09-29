@@ -81,7 +81,7 @@ it.live(
 )
 
 it.live(
-  "accepts an explicit Git provider and rejects unsupported providers without initializing",
+  "accepts an explicit Git provider and rejects unknown providers without initializing",
   () =>
     Effect.gen(function* () {
       const tmp = yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-vcs-provider-")))
@@ -91,6 +91,10 @@ it.live(
       url.searchParams.set("provider", "unknown")
       const unsupported = yield* Effect.promise(() => fetch(url, { method: "POST", headers: server.headers }))
       expect(unsupported.status).toBe(400)
+      expect(yield* Effect.promise(() => unsupported.json())).toMatchObject({
+        _tag: "InvalidRequestError",
+        field: "provider",
+      })
       expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".git", "HEAD")).exists())).toBe(false)
       expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".hg", "requires")).exists())).toBe(false)
       url.searchParams.set("provider", "git")
@@ -99,6 +103,62 @@ it.live(
       expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".git", "HEAD")).exists())).toBe(true)
     }),
   15_000,
+)
+
+it.live("returns 501 when a registered VCS provider has no initializer", () =>
+  Effect.gen(function* () {
+    const tmp = yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-vcs-no-init-")))
+    const handler = yield* ServerFetch.make(
+      {
+        database: { path: ":memory:" },
+        config: { directory: tmp.path },
+        fs: { filewatcher: false },
+        models: { fetch: false },
+      },
+      {
+        overrides: [
+          SdkPlugins.node.replace(
+            Layer.succeed(
+              SdkPlugins.Service,
+              SdkPlugins.Service.of({
+                register: () => Effect.void,
+                all: () => [
+                  {
+                    id: "read-only-vcs",
+                    revision: "test",
+                    effect: (ctx) =>
+                      ctx.vcs
+                        .transform((editor) => {
+                          editor.add({
+                            id: "read-only",
+                            name: "Read-only VCS",
+                            info: () => Effect.succeed({ branch: {} }),
+                            branches: () => Effect.succeed([]),
+                            status: () => Effect.succeed([]),
+                            diff: () => Effect.succeed([]),
+                          })
+                        })
+                        .pipe(Effect.asVoid),
+                  },
+                ],
+              }),
+            ),
+          ),
+        ],
+      },
+    )
+    const url = new URL("http://opencode.local/api/vcs/init")
+    url.searchParams.set("location[directory]", tmp.path)
+    url.searchParams.set("provider", "read-only")
+    const response = yield* Effect.promise(() => handler(new Request(url, { method: "POST" })))
+    expect(response.status).toBe(501)
+    expect(yield* Effect.promise(() => response.json())).toMatchObject({
+      _tag: "VcsInitNotSupportedError",
+      providerID: "read-only",
+    })
+    expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".git", "HEAD")).exists())).toBe(false)
+    expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".hg", "requires")).exists())).toBe(false)
+  }),
 )
 
 const describeHg = Bun.which("hg") ? describe : describe.skip
