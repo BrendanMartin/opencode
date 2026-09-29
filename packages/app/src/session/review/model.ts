@@ -171,7 +171,7 @@ export function createSessionReview(input: {
     if (!sessionID) return
     setState("initializingGit", true)
     void server.api.vcs
-      .init({ location: { directory } })
+      .init({ location: { directory }, provider: "git" })
       .then(async () => {
         data.project.invalidate()
         data.session.invalidate(sessionID)

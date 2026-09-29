@@ -63,5 +63,6 @@ for (const view of ["desktop", "mobile"] as const) {
     await test.info().attach("review-after-git", { body: await panel.screenshot(), contentType: "image/png" })
     expect(requests).toHaveLength(1)
     expect(new URL(requests[0]!).searchParams.get("location[directory]")).toBe(directory)
+    expect(new URL(requests[0]!).searchParams.get("provider")).toBe("git")
   })
 }

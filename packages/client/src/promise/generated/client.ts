@@ -2019,7 +2019,7 @@ export function make(options: ClientOptions) {
           {
             method: "POST",
             path: `/api/vcs/init`,
-            query: { location: input?.["location"] },
+            query: { location: input?.["location"], provider: input?.["provider"] },
             successStatus: 204,
             declaredStatuses: [400, 401, 409, 503],
             empty: true,

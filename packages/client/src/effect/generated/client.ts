@@ -1454,7 +1454,9 @@ const adaptGroupWorktree = (raw: RawClient["server.worktree"]) => ({
 
 const EndpointVcsInit = (raw: RawClient["server.vcs"]) => (input?: VcsInitInput) =>
   preserveEffect<VcsInitOutput>()(
-    raw["vcs.init"]({ query: { location: input?.["location"] } }).pipe(Effect.mapError(mapClientError)),
+    raw["vcs.init"]({ query: { location: input?.["location"], provider: input?.["provider"] } }).pipe(
+      Effect.mapError(mapClientError),
+    ),
   )
 
 const EndpointVcsGet = (raw: RawClient["server.vcs"]) => (input?: VcsGetInput) =>

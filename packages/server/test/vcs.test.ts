@@ -81,6 +81,26 @@ it.live(
 )
 
 it.live(
+  "accepts an explicit Git provider and rejects unsupported providers without initializing",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-vcs-provider-")))
+      const server = yield* startServer(path.join(tmp.path, "config"))
+      const url = new URL("/api/vcs/init", server.base)
+      url.searchParams.set("location[directory]", tmp.path)
+      url.searchParams.set("provider", "hg")
+      const unsupported = yield* Effect.promise(() => fetch(url, { method: "POST", headers: server.headers }))
+      expect(unsupported.status).toBe(400)
+      expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".git", "HEAD")).exists())).toBe(false)
+      url.searchParams.set("provider", "git")
+      const initialized = yield* Effect.promise(() => fetch(url, { method: "POST", headers: server.headers }))
+      expect(initialized.status).toBe(204)
+      expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".git", "HEAD")).exists())).toBe(true)
+    }),
+  15_000,
+)
+
+it.live(
   "serves lazy review bases, committed diffs, and unavailable-base errors",
   () =>
     Effect.gen(function* () {

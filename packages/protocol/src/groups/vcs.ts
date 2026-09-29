@@ -7,6 +7,11 @@ import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/un
 import { LocationQuery, locationQueryOpenApi } from "./location.js"
 import { ConflictError, InvalidRequestError, ServiceUnavailableError } from "../errors.js"
 
+const InitQuery = Schema.Struct({
+  ...LocationQuery.fields,
+  provider: Schema.optional(Schema.Literal("git")),
+})
+
 const BranchesQuery = Schema.Struct({
   ...LocationQuery.fields,
   search: Schema.optional(Schema.String),
@@ -23,7 +28,7 @@ const DiffQuery = Schema.Struct({
 export const VcsGroup = HttpApiGroup.make("server.vcs")
   .add(
     HttpApiEndpoint.post("vcs.init", "/api/vcs/init", {
-      query: LocationQuery,
+      query: InitQuery,
       success: HttpApiSchema.NoContent,
       error: [ConflictError, InvalidRequestError, ServiceUnavailableError],
     })
@@ -32,7 +37,8 @@ export const VcsGroup = HttpApiGroup.make("server.vcs")
         OpenApi.annotations({
           identifier: "vcs.init",
           summary: "Initialize Git repository",
-          description: "Initialize Git in a markerless project's directory and refresh its location services.",
+          description:
+            "Initialize the selected repository type in a markerless project's directory and refresh its location services. Only git is supported; omitting provider defaults to git.",
         }),
       ),
   )
