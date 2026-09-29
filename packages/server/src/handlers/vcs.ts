@@ -1,5 +1,6 @@
 import { Vcs } from "@opencode/core/vcs"
 import { Project } from "@opencode/core/project"
+import { Plugin } from "@opencode/core/plugin"
 import { Location } from "@opencode/core/location"
 import { LocationServiceMap } from "@opencode/core/location-services"
 import { ConflictError, InvalidRequestError, ServiceUnavailableError } from "@opencode/protocol/errors"
@@ -13,19 +14,29 @@ export const VcsHandler = HttpApiBuilder.group(Api, "server.vcs", (handlers) =>
     const project = yield* Project.Service
     const locations = yield* LocationServiceMap.Service
     return handlers
-      .handle("vcs.init", () =>
+      .handle("vcs.init", (ctx) =>
         Effect.gen(function* () {
           const location = yield* Location.Service
           const directory = location.project.directory
-          yield* project.initializeGit(directory).pipe(
+          const providerID = ctx.query.provider ?? "git"
+          yield* Plugin.awaitActivation
+          const vcs = yield* Vcs.Service
+          yield* vcs.initialize(providerID).pipe(
             Effect.mapError((error) => {
               if (error.kind === "missing")
                 return new InvalidRequestError({ message: "Project directory does not exist", field: "location" })
               if (error.kind === "conflict")
                 return new ConflictError({ message: "Project already has version control", resource: directory })
-              return new ServiceUnavailableError({ service: "git", message: "Git initialization failed" })
+              if (error.kind === "unsupported")
+                return new InvalidRequestError({
+                  message: "VCS provider does not support initialization",
+                  field: "provider",
+                })
+              return new ServiceUnavailableError({ service: providerID, message: "VCS initialization failed" })
             }),
           )
+          if (!(yield* project.resolve(directory)).vcs)
+            return yield* new ServiceUnavailableError({ service: providerID, message: "VCS initialization failed" })
           yield* locations.invalidate(
             Location.Ref.make({ directory: location.directory, workspaceID: location.workspaceID }),
           )

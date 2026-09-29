@@ -6252,11 +6252,11 @@ export type WorktreeRefreshOutput = void
 export type VcsInitInput = {
   readonly location?: {
     readonly location?: { readonly directory?: string | undefined } | undefined
-    readonly provider?: "git" | undefined
+    readonly provider?: string | undefined
   }["location"]
   readonly provider?: {
     readonly location?: { readonly directory?: string | undefined } | undefined
-    readonly provider?: "git" | undefined
+    readonly provider?: string | undefined
   }["provider"]
 }
 

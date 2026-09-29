@@ -36,10 +36,6 @@ export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Project.
   projectID: ID,
 }) {}
 
-export class InitializeGitError extends Schema.TaggedError<InitializeGitError>()("Project.InitializeGitError", {
-  kind: Schema.Literals(["missing", "conflict", "failed"]),
-}) {}
-
 export interface Resolved {
   readonly previous?: ID
   readonly id: ID
@@ -70,7 +66,6 @@ export interface Interface {
   readonly activate: (projectID: ID) => Effect.Effect<void>
   /** Resolves and persists the owning Project. */
   readonly resolve: (input: AbsolutePath, options?: { readonly discovery?: boolean }) => Effect.Effect<Resolved>
-  readonly initializeGit: (directory: AbsolutePath) => Effect.Effect<Resolved, InitializeGitError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Project") {}
@@ -387,17 +382,7 @@ const layer = Layer.effect(
       })
     })
 
-    const initializeGit = Effect.fn("Project.initializeGit")(function* (directory: AbsolutePath) {
-      if (!(yield* fs.isDir(directory))) return yield* new InitializeGitError({ kind: "missing" })
-      if ((yield* resolve(directory)).vcs) return yield* new InitializeGitError({ kind: "conflict" })
-      const result = yield* proc
-        .run(ChildProcess.make("git", ["init"], { cwd: directory, stdin: "ignore" }))
-        .pipe(Effect.mapError(() => new InitializeGitError({ kind: "failed" })))
-      if (result.exitCode !== 0) return yield* new InitializeGitError({ kind: "failed" })
-      return yield* resolve(directory)
-    })
-
-    return Service.of({ list, update, activate, resolve, initializeGit })
+    return Service.of({ list, update, activate, resolve })
   }),
 )
 

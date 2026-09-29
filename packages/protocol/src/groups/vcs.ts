@@ -9,7 +9,7 @@ import { ConflictError, InvalidRequestError, ServiceUnavailableError } from "../
 
 const InitQuery = Schema.Struct({
   ...LocationQuery.fields,
-  provider: Schema.optional(Schema.Literal("git")),
+  provider: Schema.optional(Schema.String),
 })
 
 const BranchesQuery = Schema.Struct({
@@ -36,9 +36,9 @@ export const VcsGroup = HttpApiGroup.make("server.vcs")
       .annotateMerge(
         OpenApi.annotations({
           identifier: "vcs.init",
-          summary: "Initialize Git repository",
+          summary: "Initialize VCS repository",
           description:
-            "Initialize the selected repository type in a markerless project's directory and refresh its location services. Only git is supported; omitting provider defaults to git.",
+            "Initialize a repository using the selected VCS provider in a markerless project's directory and refresh its location services. Omitting provider defaults to git; built-in git and hg providers support initialization.",
         }),
       ),
   )

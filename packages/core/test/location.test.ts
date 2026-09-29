@@ -15,7 +15,6 @@ const projectLayer = Layer.succeed(
     list: () => Effect.succeed([]),
     update: () => Effect.die("not implemented"),
     activate: () => Effect.void,
-    initializeGit: () => Effect.die("not implemented"),
     resolve: () =>
       Effect.succeed({
         id: Project.ID.make("project"),

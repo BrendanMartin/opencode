@@ -1,6 +1,6 @@
 import path from "node:path"
 import { $ } from "bun"
-import { expect } from "bun:test"
+import { describe, expect } from "bun:test"
 import { SdkPlugins } from "@opencode/core/plugin/sdk"
 import { Effect, Layer, Schedule } from "effect"
 import { tmpdir } from "../../core/test/fixture/tmpdir"
@@ -88,10 +88,11 @@ it.live(
       const server = yield* startServer(path.join(tmp.path, "config"))
       const url = new URL("/api/vcs/init", server.base)
       url.searchParams.set("location[directory]", tmp.path)
-      url.searchParams.set("provider", "hg")
+      url.searchParams.set("provider", "unknown")
       const unsupported = yield* Effect.promise(() => fetch(url, { method: "POST", headers: server.headers }))
       expect(unsupported.status).toBe(400)
       expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".git", "HEAD")).exists())).toBe(false)
+      expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".hg", "requires")).exists())).toBe(false)
       url.searchParams.set("provider", "git")
       const initialized = yield* Effect.promise(() => fetch(url, { method: "POST", headers: server.headers }))
       expect(initialized.status).toBe(204)
@@ -99,6 +100,51 @@ it.live(
     }),
   15_000,
 )
+
+const describeHg = Bun.which("hg") ? describe : describe.skip
+
+describeHg("Mercurial initialization", () => {
+  it.live(
+    "initializes and serves an untracked-file diff through the Hg provider",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-vcs-hg-init-")))
+        yield* Effect.promise(() => Bun.write(path.join(tmp.path, "hello.txt"), "hello\n"))
+        const server = yield* startServer(path.join(tmp.path, "config"))
+        const url = new URL("/api/vcs/init", server.base)
+        url.searchParams.set("location[directory]", tmp.path)
+        url.searchParams.set("provider", "hg")
+        const initialized = yield* Effect.promise(() => fetch(url, { method: "POST", headers: server.headers }))
+        expect(initialized.status).toBe(204)
+        expect(yield* Effect.promise(() => Bun.file(path.join(tmp.path, ".hg", "requires")).exists())).toBe(true)
+        url.pathname = "/api/vcs"
+        const info = yield* Effect.tryPromise({
+          try: async () => {
+            const response = await fetch(url, { headers: server.headers })
+            const body: unknown = await response.json()
+            if (!isRecord(body) || !isRecord(body.data) || body.data.provider !== "hg")
+              throw new Error("Mercurial provider not ready")
+            return body
+          },
+          catch: (cause) => cause,
+        }).pipe(Effect.retry(Schedule.spaced("10 millis")), Effect.timeout("2 seconds"))
+        expect(info).toMatchObject({ data: { provider: "hg" } })
+        url.pathname = "/api/vcs/diff"
+        url.searchParams.set("mode", "working")
+        const diff = yield* Effect.promise(() => fetch(url, { headers: server.headers }))
+        expect(diff.status).toBe(200)
+        expect(yield* Effect.promise(() => diff.json())).toMatchObject({
+          data: expect.arrayContaining([expect.objectContaining({ file: "hello.txt" })]),
+        })
+        url.pathname = "/api/vcs/init"
+        url.searchParams.delete("mode")
+        url.searchParams.set("provider", "git")
+        const repeated = yield* Effect.promise(() => fetch(url, { method: "POST", headers: server.headers }))
+        expect(repeated.status).toBe(409)
+      }),
+    15_000,
+  )
+})
 
 it.live(
   "serves lazy review bases, committed diffs, and unavailable-base errors",

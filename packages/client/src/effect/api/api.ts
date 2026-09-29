@@ -2225,7 +2225,7 @@ export interface WorktreeApi<E = never> {
 
 export type VcsInitInput = {
   readonly location?: { readonly directory?: string | undefined } | undefined
-  readonly provider?: "git" | undefined
+  readonly provider?: string | undefined
 }
 export type VcsInitOutput = void
 export type VcsInitOperation<E = never> = (input?: VcsInitInput) => Effect.Effect<VcsInitOutput, E>
