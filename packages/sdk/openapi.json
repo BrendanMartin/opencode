@@ -23081,6 +23081,9 @@
           "approved": {
             "type": "boolean"
           },
+          "denied": {
+            "type": "boolean"
+          },
           "details": {
             "$ref": "#/components/schemas/PermissionClassificationDetails"
           }

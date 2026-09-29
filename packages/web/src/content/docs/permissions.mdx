@@ -73,7 +73,7 @@ Read-only actions — `read`, `glob`, `grep`, `list`, and `lsp` — are never se
 ### What it never does
 
 - **`deny` rules are always enforced.** A denied action stays denied and is never sent for review.
-- **Your `"always"` grants are respected.** Approving something with *always* keeps working; it is not re-reviewed.
+- **Your `"always"` grants are respected.** Approving something with _always_ keeps working; it is not re-reviewed.
 - **Actions inside subagents are never auto-approved.** A subagent's prompt is written by a model, not by you, so it cannot be treated as your authorization.
 - **It fails closed.** A timeout, an unavailable model, or any error results in the normal approval prompt, never an approval.
 - **It never notifies you about an approval.** An auto-approved action does not fire a "Permission needs input" desktop notification, since nothing is waiting on you.
@@ -93,6 +93,23 @@ By default the mode uses the active provider's small model. To pick a specific o
 ```
 
 Use a fast, non-reasoning model. Reviews that take longer than 15 seconds fall back to the normal prompt.
+
+### Using TypeSafe Jev
+
+To use Jev instead of the active provider's small model, first store a TypeSafe API key with `opencode auth login`. Choose **Other** and enter `typesafe` as the provider ID. OpenCode stores that credential in its existing auth store; the key does not belong in `opencode.json`.
+
+```json title="opencode.json"
+{
+  "$schema": "https://opencode.ai/config.json",
+  "experimental": { "auto_approve": true },
+  "auto_approve": {
+    "backend": "jev",
+    "jev": { "model": "jev-latest" }
+  }
+}
+```
+
+The `jev` model setting is optional and defaults to `jev-latest`. Optional `instructions`, `criteria`, and `min_probability` tune the fixed `approve`/`ask`/`deny` question without changing its contract. Jev `approve` runs the action, `ask` opens the normal prompt, and `deny` rejects it. Omitting `backend` keeps the existing OpenCode model classifier. An unavailable credential, malformed response, or request failure still opens the normal prompt.
 
 ### Inspecting decisions
 

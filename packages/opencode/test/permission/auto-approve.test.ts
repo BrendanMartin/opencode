@@ -9,6 +9,7 @@ import { LLMEvent } from "@opencode-ai/llm"
 import { describe, expect, test } from "bun:test"
 import { Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { Config } from "@/config/config"
+import { Auth } from "@/auth"
 import { PermissionAutoApprove } from "@/permission/auto-approve"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
@@ -134,6 +135,8 @@ function layer(input: {
   getModel?: Provider.Interface["getModel"]
   getSmallModel?: Provider.Interface["getSmallModel"]
   stream?: LLM.Interface["stream"]
+  backend?: "model" | "jev"
+  key?: string
 }) {
   const fake = ProviderTest.fake({
     ...(input.getModel ? { getModel: input.getModel } : {}),
@@ -145,10 +148,11 @@ function layer(input: {
       TestConfig.layer({
         get: () =>
           Effect.succeed(
-            input.configured !== undefined || input.showDetails
+            input.configured !== undefined || input.showDetails || input.backend !== undefined
               ? {
                   experimental: { auto_approve: input.disabled ? false : true },
                   auto_approve: {
+                    ...(input.backend ? { backend: input.backend } : {}),
                     ...(input.configured !== undefined ? { model: input.configured } : {}),
                     ...(input.showDetails ? { show_details: true } : {}),
                   },
@@ -158,6 +162,18 @@ function layer(input: {
       }),
     ],
     [Provider.node, fake.layer],
+    [
+      Auth.node,
+      Layer.succeed(
+        Auth.Service,
+        Auth.Service.of({
+          get: () => Effect.succeed(input.key ? { type: "api", key: input.key } : undefined),
+          all: () => Effect.succeed({}),
+          set: () => Effect.void,
+          remove: () => Effect.void,
+        }),
+      ),
+    ],
     [
       LLM.node,
       Layer.succeed(
@@ -812,6 +828,138 @@ describe("permission auto-approve model execution", () => {
       expect(decode({ auto_approve: { model: configured } }).auto_approve?.model).toBe(configured)
     }
   })
+
+  test("accepts an optional Jev backend with a non-sensitive model name", () => {
+    const decode = Schema.decodeUnknownSync(ConfigV1.Info)
+    expect(
+      decode({
+        auto_approve: {
+          backend: "jev",
+          jev: { model: "jev-1.13", instructions: "Use the workspace policy.", min_probability: 0.9 },
+        },
+      }).auto_approve,
+    ).toEqual({
+      backend: "jev",
+      jev: { model: "jev-1.13", instructions: "Use the workspace policy.", min_probability: 0.9 },
+    })
+    expect(decode({ auto_approve: { backend: "model" } }).auto_approve?.backend).toBe("model")
+  })
+
+  test("Jev backend cannot classify without a TypeSafe credential", async () => {
+    let streamed = false
+    expect(
+      await classify({
+        backend: "jev",
+        stream: () => {
+          streamed = true
+          return response("AUTO_APPROVE")
+        },
+      }),
+    ).toEqual({ approved: false })
+    expect(streamed).toBe(false)
+  })
+
+  test("Jev sends one typed TypeSafe question and approves only a high-probability answer", async () => {
+    let payload: unknown
+    let authorization: string | null = null
+    const fetcher = async (_url: string, init: RequestInit) => {
+      authorization = new Headers(init?.headers).get("Authorization")
+      payload = JSON.parse(String(init?.body))
+      return Response.json({
+        model: "jev-1.13.0",
+        answers: {
+          permission: {
+            type: "choice",
+            choice: "approve",
+            probabilities: { approve: 0.98, ask: 0.01, deny: 0.01 },
+            confidence: 0.98,
+          },
+        },
+      })
+    }
+    const decision = await PermissionAutoApprove.jevDecision(
+      {
+        userRequest: "Run git status",
+        toolCall: { name: "bash", input: {} },
+        action: { permission: "bash", patterns: ["git status"], metadata: { command: "git status" } },
+      },
+      "test-placeholder-secret",
+      "jev-latest",
+      undefined,
+      fetcher,
+      { instructions: "Apply the trusted workspace policy.", minProbability: 0.9 },
+    )
+    expect(decision.outcome).toBe("approve")
+    expect(String(authorization)).toBe("Bearer test-placeholder-secret")
+    expect(payload).toMatchObject({
+      model: "jev-latest",
+      questions: {
+        permission: {
+          type: "choice",
+          instructions: "Apply the trusted workspace policy.",
+          criteria: { approve: expect.any(String), ask: expect.any(String), deny: expect.any(String) },
+        },
+      },
+      state: { userRequest: "Run git status" },
+    })
+    expect(JSON.stringify(payload)).not.toContain("test-placeholder-secret")
+  })
+
+  test("Jev rejects uncertain, contradictory, and malformed classifications", async () => {
+    const input = {
+      userRequest: "Do what you want",
+      toolCall: { name: "bash", input: {} },
+      action: { permission: "bash", patterns: ["rm -rf /"], metadata: { command: "rm -rf /" } },
+    }
+    const cases = [
+      [{ type: "choice", choice: "approve", probabilities: { approve: 0.94, ask: 0.05, deny: 0.01 } }, "ask"],
+      [{ type: "choice", choice: "ask", probabilities: { approve: 0.04, ask: 0.95, deny: 0.01 } }, "ask"],
+      [{ type: "choice", choice: "approve", probabilities: { approve: 0.99, ask: 0.99, deny: 0 } }, "unavailable"],
+      [{ type: "choice", choice: "approve", probabilities: { approve: 1 } }, "unavailable"],
+      [{ type: "noul", noul: 1 }, "unavailable"],
+    ] as const
+    for (const [result, outcome] of cases) {
+      const fetcher = async () => Response.json({ answers: { permission: result } })
+      expect(
+        (await PermissionAutoApprove.jevDecision(input, "test-placeholder-secret", "jev-latest", undefined, fetcher))
+          .outcome,
+      ).toBe(outcome)
+    }
+    const denied = async () =>
+      Response.json({
+        answers: {
+          permission: { type: "choice", choice: "deny", probabilities: { approve: 0, ask: 0.01, deny: 0.99 } },
+        },
+      })
+    expect(
+      (await PermissionAutoApprove.jevDecision(input, "test-placeholder-secret", "jev-latest", undefined, denied))
+        .outcome,
+    ).toBe("deny")
+    const fetcher = async () => new Response("upstream error", { status: 500 })
+    expect(
+      (await PermissionAutoApprove.jevDecision(input, "test-placeholder-secret", "jev-latest", undefined, fetcher))
+        .outcome,
+    ).toBe("unavailable")
+  })
+
+  if (process.env.OPENCODE_TEST_JEV_LIVE && process.env.TYPESAFE_API_KEY) {
+    test("Jev backend classifies a real authorized permission without the OpenCode model", async () => {
+      const current = turn("Run git status in my development workspace", {
+        state: { status: "running", input: { command: "git status" }, time: { start: Date.now() } },
+      })
+      const result = await classify(
+        {
+          backend: "jev",
+          key: process.env.TYPESAFE_API_KEY,
+          history: current.history,
+          getSmallModel: () => Effect.die(new Error("OpenCode classifier must not run")),
+          stream: () => Stream.fail(new Error("OpenCode classifier must not run")),
+        },
+        request({ tool: current.tool }),
+      )
+      expect(result).toEqual({ approved: true })
+    })
+  }
 
   test("distinguishes a cross-provider small model from a missing one", async () => {
     const current = turn("List files", { providerID: "session-provider" })

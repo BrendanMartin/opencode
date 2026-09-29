@@ -79,6 +79,29 @@ export const Info = Schema.Struct({
   }),
   auto_approve: Schema.optional(
     Schema.Struct({
+      backend: Schema.optional(Schema.Literals(["model", "jev"])).annotate({
+        description: "Classifier backend for TUI auto-approve mode. Defaults to the OpenCode small model.",
+      }),
+      jev: Schema.optional(
+        Schema.Struct({
+          model: Schema.optional(Schema.String).annotate({
+            description: "TypeSafe System One model for Jev classification. Defaults to jev-latest.",
+          }),
+          instructions: Schema.optional(Schema.String).annotate({
+            description: "Trusted policy guidance for the fixed Jev permission question.",
+          }),
+          criteria: Schema.optional(
+            Schema.Struct({
+              approve: Schema.optional(Schema.String),
+              ask: Schema.optional(Schema.String),
+              deny: Schema.optional(Schema.String),
+            }),
+          ),
+          min_probability: Schema.optional(Schema.Finite).annotate({
+            description: "Minimum probability required before accepting Jev's selected outcome. Defaults to 0.95.",
+          }),
+        }),
+      ),
       model: Schema.optional(Schema.String).annotate({
         description:
           "Model used to classify permission requests in TUI auto-approve mode, in the format provider/model. Defaults to the active provider's small model.",

@@ -348,13 +348,14 @@ export const {
             void sdk.client.permission
               .classify({ requestID: request.id, directory, workspace }, { signal: attempt.classify.signal })
               .then((result) => {
-                const decision = result.data?.approved === true
+                const approved = result.data?.approved === true
+                const denied = result.data?.denied === true
                 // The audit trail is not opt-in: show_details controls only the classifier
                 // input/output, never whether the decision itself is recorded.
-                if (decision || result.data?.details) {
+                if (approved || denied || result.data?.details) {
                   setStore("auto_approve", request.id, {
                     request,
-                    approved: decision,
+                    approved,
                     ...(result.data?.details ?? {}),
                   })
                 }
@@ -366,6 +367,28 @@ export const {
                 ) {
                   fallbackPermission(attempt)
                   return
+                }
+                if (result.data?.denied === true) {
+                  attempt.replying = true
+                  attempt.replyTimeout = setTimeout(() => {
+                    attempt.replying = false
+                    attempt.reply.abort()
+                    fallbackPermission(attempt)
+                  }, replyDelay())
+                  return sdk.client.permission
+                    .reply(
+                      { requestID: request.id, reply: "reject", directory, workspace },
+                      { signal: attempt.reply.signal },
+                    )
+                    .then((reply) => {
+                      attempt.replying = false
+                      clearTimeout(attempt.replyTimeout)
+                      if (reply.data === true || attempt.resolved) {
+                        resolveAttempt(attempt)
+                        return
+                      }
+                      fallbackPermission(attempt)
+                    })
                 }
                 if (result.data?.approved !== true) {
                   fallbackPermission(attempt)
